@@ -8,7 +8,7 @@ files, and players connect with an unmodified client.
 
 > **Not ready for deployment.**
 > LyraCore is in an early phase of development and is not secure. Do not use it for a public realm.
-
+> THIS IS A FORK I HAD MY AGENT MAKE IN 10 MINUTES IT DOES NOT FUNCTION WELL
 ## Quickstart
 
 ### Requirements
