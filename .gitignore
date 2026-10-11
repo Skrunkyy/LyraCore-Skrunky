@@ -1,6 +1,10 @@
 /target
 **/*.rs.bk
 
+# The vendored Windows CLI (`tools/lyracore-cli`) is its own Cargo workspace, so its build output
+# lands in its own `target/`, not the root's.
+/tools/lyracore-cli/target/
+
 # Local lifecycle state, logs, process ownership locks, and the pinned-tool caches: the `lyracore`
 # CLI (.lyracore/cli/<rev>/) and the wire harness (.lyracore/wire-harness/<sha>/, #246 — a checkout
 # of LyraCoreProject/wire-harness plus its own target/, which is why this must stay ignored).

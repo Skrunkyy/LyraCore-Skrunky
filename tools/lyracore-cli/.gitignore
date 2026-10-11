@@ -1,0 +1,6 @@
+/target
+**/*.rs.bk
+
+# Local lifecycle state, logs, and process ownership records.
+/.lyracore/
+__pycache__/

@@ -1,0 +1,49 @@
+# Standalone package: this crate also lives in the LyraCore workspace, so the values that were
+# inherited there (`edition`, `license`, `rust-version`) are spelled out here.
+[workspace]
+
+[package]
+name = "lyracore-cli"
+version = "0.1.0"
+edition = "2021"
+# 1.85 is a floor the LOCKED dependency graph sets, not this crate's own code: several
+# transitive crates declare `edition = "2024"`, which Cargo needs 1.85 just to parse. (The
+# LyraCore workspace this CLI drives pins 1.93.0 for the same class of reason.)
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+description = "Source-first developer CLI for LyraCore"
+repository = "https://github.com/LyraCoreProject/lyracore-cli"
+publish = false
+
+[[bin]]
+name = "lyracore"
+path = "src/bin/main.rs"
+
+[dependencies]
+thiserror = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Same pin as the gateway: the provisioning password is held in a wiped buffer end to end.
+zeroize = "=1.8.1"
+blake3 = "1"
+# Build Identity hashing (LyraCore#316): the recorded inputs are specified as SHA-256, distinct
+# from `artifact.rs`'s BLAKE3 canonical-form digest, which this crate also carries.
+sha2 = "0.10"
+tempfile = "3"
+
+# Platform seams (`src/platform.rs`). `rustix` supplies the Unix exclusive lock and the
+# no-replace rename; the Win32 API supplies the same guarantees on Windows. Kept target-specific
+# so neither backend is compiled where it cannot work.
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1", features = ["fs"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_Threading",
+] }
+
+[dev-dependencies]

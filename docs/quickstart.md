@@ -6,7 +6,9 @@ import, no world database to source. What you get is a **seed fixture** — enou
 layer works. [Getting the real world](#getting-the-real-world) is the separate, optional step that
 turns it into Elwynn.
 
-**Linux and macOS.** Windows/WSL is not covered (and not supported today).
+**Linux, macOS and native Windows.** Windows has its own walkthrough —
+[`quickstart-windows.md`](./quickstart-windows.md), driven by `install.ps1` and `lyracore.cmd`
+instead of `install.sh` and `./lyracore`. WSL is untested.
 
 **Read this first, it decides what you need:**
 

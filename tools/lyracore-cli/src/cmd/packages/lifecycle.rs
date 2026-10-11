@@ -1,0 +1,865 @@
+//! `lyracore packages enable`, `lyracore packages disable` and `lyracore packages remove`.
+//!
+//! ENABLED IS A LOCATION, not a recorded flag. `packages/` is what the server build discovers,
+//! `.lyracore/packages-disabled/` is a directory the build cannot see, and enabling or disabling is
+//! the one rename between them. Nothing can disagree with the filesystem about which Packages the
+//! next build compiles; a state file, a stamp key or a config entry all could.
+//!
+//! Both directories are on the same filesystem, so the rename is atomic and its inverse is the
+//! other command. The provenance stamp lives inside the folder, so a move carries it along
+//! untouched. A re-enabled Package still says where it came from and what it looked like when it
+//! was installed.
+//!
+//! `disable` runs Package Teardown first when the recorded dev stack is up: `teardown_package` on
+//! every Shard, then once more on each. A publish cannot remove a table that holds rows, and
+//! teardown empties them. Teardown deletes the Package's rows, so `disable` asks first, the way
+//! `remove` does. `enable` destroys nothing and does not ask.
+//!
+//! `remove` is the one that deletes, so it is the one with gates. It requires the Package to be
+//! disabled already, because the build must stop compiling a Package before the folder goes. It
+//! refuses a tree that no longer matches its stamp: an operator's own edits to an installed copy
+//! exist nowhere else, and this command cannot get them back.
+//!
+//! None of the three publishes anything or synchronizes a client. The module on every database is
+//! whatever was last published until the operator publishes again, and each command ends by naming
+//! the steps it did not run.
+
+use super::stamp::{self, SOURCE_GIT, SOURCE_LOCAL, SOURCE_OFFICIAL};
+use super::{
+    collision, collision_reason, confirm, find, review::TrustReview, shard_list, shell_quote,
+    InstalledPackage, PackageName, PackageState,
+};
+use crate::cmd::dev::{operator_call_failure, reducer_url};
+use crate::cmd::import::Prompt;
+use crate::http::HttpClient;
+use crate::proc::ProcessRunner;
+use crate::project::{Component, ProjectLayout};
+use crate::state::RuntimeState;
+use crate::{Error, Result};
+use std::path::Path;
+
+/// The Module reducer that stops a Package on one Shard. Idempotent.
+const TEARDOWN_REDUCER: &str = "teardown_package";
+
+/// Move a disabled Package back into `packages/`, where the next build compiles it.
+pub fn enable(project: &ProjectLayout, name: &str) -> Result<()> {
+    let name = PackageName::parse(name)?;
+    let package = find(project, &name)?;
+    if package.state == PackageState::Enabled {
+        return Err(Error::Usage(format!(
+            "'{}' is already enabled, at {}. Nothing was moved.",
+            name.as_str(),
+            package.dir.display()
+        )));
+    }
+
+    let destination = project.packages_dir().join(name.as_str());
+    let moved = move_package(project, &package, &destination, "enable")?;
+
+    println!();
+    println!("enabled {}", name.as_str());
+    print!("{moved}");
+    print!("{}", super::provenance_report(package.stamp.as_ref()));
+
+    println!();
+    print!("{}", super::activation_steps(&destination));
+    println!();
+    println!(
+        "undo this move with `lyracore packages disable {}`.",
+        name.as_str()
+    );
+    Ok(())
+}
+
+/// What `disable` needs to reach the Realm for Package Teardown.
+pub struct Realm<'a> {
+    pub runner: &'a dyn ProcessRunner,
+    pub http: &'a dyn HttpClient,
+    pub prompt: &'a dyn Prompt,
+}
+
+/// Move an enabled Package out of `packages/`, so the build stops seeing it. Package Teardown runs
+/// on every Shard first when the recorded dev stack is up.
+pub fn disable(project: &ProjectLayout, realm: &Realm, name: &str, yes: bool) -> Result<()> {
+    let name = PackageName::parse(name)?;
+    let package = find(project, &name)?;
+    if package.state == PackageState::Disabled {
+        return Err(Error::Usage(format!(
+            "'{}' is already disabled, at {}. Nothing was moved.",
+            name.as_str(),
+            package.dir.display()
+        )));
+    }
+
+    let review = TrustReview::scan(&package.dir)?;
+    let state = RuntimeState::load(&project.state_file())?;
+    if state.record(Component::Spacetime).is_some() {
+        let shards = super::recorded_databases(project)?;
+        println!();
+        print!("{}", teardown_notice(&name, &shards));
+        confirm(
+            realm.prompt,
+            &format!(
+                "Tear down '{}' on every Shard and move it out of the build?",
+                name.as_str()
+            ),
+            "Nothing was torn down or moved.",
+            yes,
+        )?;
+        teardown(project, realm, &name, &shards)?;
+    } else if !review.tables.is_empty() {
+        // No recorded stack to tear down on. The tables are reported before the move, because a
+        // publish that would remove them refuses while they hold rows.
+        println!();
+        print!("{}", table_warning(&name, &review.tables));
+    }
+
+    let destination = project.packages_disabled_dir().join(name.as_str());
+    let moved = move_package(project, &package, &destination, "disable")?;
+
+    println!();
+    println!("disabled {}", name.as_str());
+    print!("{moved}");
+    print!("{}", super::provenance_report(package.stamp.as_ref()));
+
+    println!();
+    print!("{}", super::activation_steps(&destination));
+    println!();
+    println!(
+        "undo this move with `lyracore packages enable {}`.",
+        name.as_str()
+    );
+    Ok(())
+}
+
+/// Run `teardown_package` for `name` on every Shard, then once more on each. The second pass
+/// catches a Character that crossed into a Shard the first pass had already torn down.
+fn teardown(
+    project: &ProjectLayout,
+    realm: &Realm,
+    name: &PackageName,
+    shards: &[String],
+) -> Result<()> {
+    let credential = crate::token::resolve_existing(realm.runner, &project.token_file())?;
+    let arguments = serde_json::to_string(&(name.as_str(),))?;
+    for _pass in 0..2 {
+        for shard in shards {
+            realm
+                .http
+                .post_json(
+                    &reducer_url(shard, TEARDOWN_REDUCER),
+                    Some(credential.token()),
+                    &arguments,
+                )
+                .map_err(|error| {
+                    Error::Process(format!(
+                        "{}\n  Package Teardown stopped at {shard}. Nothing was moved. Teardown is \
+                         idempotent: fix the cause and re-run `lyracore packages disable {}`. To \
+                         move the Package without a teardown, stop the stack first with \
+                         `lyracore dev down`.",
+                        operator_call_failure(project, shard, error),
+                        name.as_str()
+                    ))
+                })?;
+        }
+    }
+    println!("torn down {} on: {}", name.as_str(), shard_list(shards));
+    Ok(())
+}
+
+/// What Package Teardown will do, printed before the question that allows it.
+fn teardown_notice(name: &PackageName, shards: &[String]) -> String {
+    format!(
+        "Before the move, Package Teardown stops '{}' on {} Shard(s): {}\n  It empties the \
+         Package's tables and deletes its Package Config, so the next `lyracore publish`\n  can \
+         remove the tables. Its Characters go offline and stay as Dormant Characters.\n  \
+         Enabling the Package again starts it with empty tables.\n",
+        name.as_str(),
+        shards.len(),
+        shard_list(shards)
+    )
+}
+
+/// Delete a disabled Package from this checkout, after the operator confirms it.
+pub fn remove(project: &ProjectLayout, prompt: &dyn Prompt, name: &str, yes: bool) -> Result<()> {
+    let name = PackageName::parse(name)?;
+    let package = find(project, &name)?;
+    if package.state == PackageState::Enabled {
+        return Err(Error::Usage(format!(
+            "cannot remove '{}': it is enabled, at {}. Run `lyracore packages disable {}` first, \
+             so the build stops compiling the Package before the folder is deleted, and publish \
+             that change. Nothing was deleted.",
+            name.as_str(),
+            package.dir.display(),
+            name.as_str()
+        )));
+    }
+    check_recorded_and_clean(&package)?;
+
+    println!();
+    println!("{}  {}", name.as_str(), package.state.as_str());
+    print!("{}", super::provenance_report(package.stamp.as_ref()));
+    println!(
+        "  content   {}",
+        TrustReview::scan(&package.dir)?.kinds_summary()
+    );
+    println!();
+    print!("{}", recovery_note(&package.name, package.stamp.as_ref()));
+
+    confirm(
+        prompt,
+        &format!(
+            "Permanently delete '{}' and everything in {}?",
+            name.as_str(),
+            package.dir.display()
+        ),
+        "Nothing was deleted.",
+        yes,
+    )?;
+    std::fs::remove_dir_all(&package.dir).map_err(|error| {
+        Error::Process(format!(
+            "could not delete {}: {error}. Whatever is left of the Package is still there, and \
+             this command cannot finish the deletion. Remove it by hand with:\n      rm -rf -- {}",
+            package.dir.display(),
+            shell_quote(&package.dir)
+        ))
+    })?;
+
+    println!();
+    println!("removed {} from {}", name.as_str(), package.dir.display());
+    println!();
+    println!(
+        "disabling '{}' already took it out of the build, so deleting it changes nothing the \
+         module compiles. Two steps may still be outstanding from that disable, and this command \
+         ran neither:",
+        name.as_str()
+    );
+    println!(
+        "  lyracore publish       publish the module WITHOUT the Package to every database of \
+         this realm"
+    );
+    println!(
+        "  lyracore client sync   repack the client; it warns about an addon this Package left \
+         behind"
+    );
+    Ok(())
+}
+
+/// Rename one Package directory into the other inventory, refusing every collision first.
+///
+/// Returns the `from`/`to` report lines, so the caller prints one shape whichever way it moved.
+fn move_package(
+    project: &ProjectLayout,
+    package: &InstalledPackage,
+    destination: &Path,
+    verb: &str,
+) -> Result<String> {
+    // The Package being moved is still in the inventory it is leaving, hence `ignoring`. What is
+    // left to catch is the other inventory holding a DIFFERENT folder that folds onto the same
+    // generated module, which the destination path alone would not reveal.
+    if let Some(existing) = collision(project, &package.name, Some(&package.dir))? {
+        return Err(Error::Usage(format!(
+            "cannot {verb} '{}': {}. It is at {}. Nothing was moved.",
+            package.name.as_str(),
+            collision_reason(&existing, &package.name),
+            existing.dir.display()
+        )));
+    }
+    let parent = destination.parent().ok_or_else(|| {
+        Error::State(format!(
+            "Package destination {} has no parent directory",
+            destination.display()
+        ))
+    })?;
+    std::fs::create_dir_all(parent)?;
+    super::rename_no_replace(&package.dir, destination).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::AlreadyExists {
+            Error::Usage(format!(
+                "cannot {verb} '{}': {} appeared while this command was running. Nothing was \
+                 merged or overwritten.",
+                package.name.as_str(),
+                destination.display()
+            ))
+        } else {
+            Error::Process(format!(
+                "could not move {} to {}: {error}. The Package is still where it was, so nothing \
+                 the build sees has changed.",
+                package.dir.display(),
+                destination.display()
+            ))
+        }
+    })?;
+    Ok(format!(
+        "  from      {}\n  to        {}\n",
+        package.dir.display(),
+        destination.display()
+    ))
+}
+
+/// Refuse a Package whose tree is not the one its stamp recorded.
+///
+/// Two refusals, one reason: `remove` may only delete content that exists somewhere else as well.
+/// A tree that has drifted from its stamp holds the operator's own edits, and a tree with no
+/// readable stamp cannot be shown to hold anything but them.
+fn check_recorded_and_clean(package: &InstalledPackage) -> Result<()> {
+    let recorded = package
+        .stamp
+        .as_ref()
+        .filter(|stamp| !stamp.content_identity.is_empty())
+        .ok_or_else(|| {
+            Error::Usage(format!(
+                "cannot remove '{}': it has no readable provenance stamp recording a content \
+                 identity, so this command cannot tell installed content from local work. It was \
+                 created by hand, predates `lyracore packages add`, or its stamp was edited. \
+                 Delete it by hand if you are sure:\n      rm -rf -- {}\nNothing was deleted.",
+                package.name.as_str(),
+                shell_quote(&package.dir)
+            ))
+        })?;
+    let current = stamp::content_identity(&package.dir)?;
+    if current != recorded.content_identity {
+        return Err(Error::Usage(format!(
+            "cannot remove '{}': the folder no longer matches what was installed (stamp {}, on \
+             disk {current}). Those local changes exist only here, and this command cannot get \
+             them back. Copy them somewhere outside the checkout first, then remove it. Nothing \
+             was deleted.",
+            package.name.as_str(),
+            recorded.content_identity
+        )));
+    }
+    Ok(())
+}
+
+/// What a Package disabled without a teardown means for the next publish.
+///
+/// Disabling takes the tables out of the Module schema, so the next publish is a schema change that
+/// drops them. `lyracore publish` never passes SpacetimeDB's destructive wipe flag (see
+/// `cmd::publish`), so that publish stops rather than deleting rows. This informs; it does not
+/// block. Refusing to disable a Package because no stack is up would leave the operator no way to
+/// take a Package out of the build at all.
+fn table_warning(name: &PackageName, tables: &[String]) -> String {
+    format!(
+        "'{}' registers {} table(s) in the Module schema:\n      {}\n  No dev stack is \
+         recorded, so Package Teardown does not run. Disabling takes the tables\n  out of the \
+         schema, and a `lyracore publish` that would drop a table still holding rows\n  STOPS \
+         instead of deleting them. If that happens, run `lyracore packages enable {}`,\n  \
+         `lyracore dev up`, then `lyracore packages disable {}` again.\n",
+        name.as_str(),
+        tables.len(),
+        tables.join(", "),
+        name.as_str(),
+        name.as_str()
+    )
+}
+
+/// What still holds a copy of a Package about to be deleted.
+///
+/// The stamp is the only record of that, and it is the difference between a deletion the operator
+/// can undo with one `packages add` and one they cannot undo at all.
+fn recovery_note(name: &PackageName, stamp: Option<&stamp::ProvenanceStamp>) -> String {
+    match stamp {
+        Some(recorded) if recorded.source_kind == SOURCE_LOCAL && !recorded.source.is_empty() => {
+            format!(
+                "This command does not touch the Package Source it was installed from, so it can \
+                 be\ninstalled again with:\n      lyracore packages add {}\n",
+                shell_quote(Path::new(&recorded.source))
+            )
+        }
+        Some(recorded) if recorded.source_kind == SOURCE_GIT && !recorded.source.is_empty() => {
+            format!(
+                "This command does not touch the Git Package Source it was installed from \
+                 ({}, revision {}), so it can be\ninstalled again with:\n      lyracore packages \
+                 add {}\n",
+                recorded.source,
+                recorded.revision,
+                shell_quote(Path::new(&recorded.source))
+            )
+        }
+        Some(recorded)
+            if recorded.source_kind == SOURCE_OFFICIAL && !recorded.source.is_empty() =>
+        {
+            format!(
+                "This command does not touch the Official Package Source it was installed from \
+                 ({}, revision {}), so it can be\ninstalled again with:\n      lyracore packages \
+                 add {}\n",
+                recorded.source,
+                recorded.revision,
+                name.as_str()
+            )
+        }
+        // A scaffold, or a stamp that records no usable source: nothing outside this checkout is
+        // known to hold the folder.
+        _ => "Nothing outside this checkout is recorded as holding a copy of this Package. \
+              Deleting it is final.\n"
+            .to_string(),
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::stamp::ProvenanceStamp;
+    use super::*;
+    use crate::cmd::packages::tests::{candidate, checkout, Answer};
+    use crate::cmd::packages::{add, inventory};
+    use crate::http::fake::FakeHttp;
+    use crate::proc::fake::FakeStack;
+    use crate::project::Topology;
+    use crate::state::ProcessRecord;
+    use tempfile::TempDir;
+
+    /// `disable` in a checkout with no recorded dev stack, where no teardown runs.
+    pub(crate) fn disable_without_stack(project: &ProjectLayout, name: &str) -> Result<()> {
+        let stack = FakeStack::new();
+        let runner = stack.runner();
+        let realm = Realm {
+            runner: &runner,
+            http: &FakeHttp::failing("no stack is recorded, so nothing may call the Realm"),
+            prompt: &Answer("no"),
+        };
+        disable(project, &realm, name, false)
+    }
+
+    /// A recorded sharded dev stack and a persisted operator credential.
+    fn with_stack(project: &ProjectLayout) {
+        crate::token::resolve_or_mint(
+            &FakeStack::new()
+                .fail_on("login show", "not logged in")
+                .runner(),
+            &FakeHttp::new(),
+            &project.token_file(),
+            "http://127.0.0.1:3000",
+        )
+        .unwrap();
+        RuntimeState {
+            spacetime: Some(ProcessRecord {
+                pid: 4000,
+                identity: "spacetime".to_string(),
+            }),
+            gateway: Some(ProcessRecord {
+                pid: 4001,
+                identity: "gateway".to_string(),
+            }),
+            topology: Topology::Sharded.as_str().to_string(),
+            ..Default::default()
+        }
+        .save(&project.state_file())
+        .unwrap();
+    }
+
+    fn teardown_calls(http: &FakeHttp) -> Vec<String> {
+        http.requests()
+            .into_iter()
+            .filter(|request| request.url.ends_with("/call/teardown_package"))
+            .map(|request| {
+                assert_eq!(request.body, r#"["greeter"]"#);
+                assert!(request.bearer.is_some(), "teardown is an Operator call");
+                request.url
+            })
+            .collect()
+    }
+
+    #[test]
+    fn with_a_stack_up_disable_tears_down_every_shard_twice_before_the_move() {
+        let tmp = TempDir::new().unwrap();
+        let project = checkout(&tmp);
+        installed(&tmp, &project, "greeter");
+        with_stack(&project);
+        let stack = FakeStack::new();
+        let runner = stack.runner();
+        let http = FakeHttp::new();
+        let realm = Realm {
+            runner: &runner,
+            http: &http,
+            prompt: &Answer("yes"),
+        };
+
+        disable(&project, &realm, "greeter", false).unwrap();
+
+        let shards = crate::cmd::packages::recorded_databases(&project).unwrap();
+        let calls = teardown_calls(&http);
+        assert_eq!(calls.len(), shards.len() * 2, "{calls:?}");
+        for (call, shard) in calls.iter().zip(shards.iter().chain(shards.iter())) {
+            assert!(call.contains(&format!("/database/{shard}/")), "{call}");
+        }
+        assert!(project.packages_disabled_dir().join("greeter").is_dir());
+    }
+
+    #[test]
+    fn a_refused_teardown_moves_nothing() {
+        let tmp = TempDir::new().unwrap();
+        let project = checkout(&tmp);
+        installed(&tmp, &project, "greeter");
+        with_stack(&project);
+        let stack = FakeStack::new();
+        let runner = stack.runner();
+        let http = FakeHttp::refusing("teardown_package", "Character 7 is crossing between Shards");
+        let realm = Realm {
+            runner: &runner,
+            http: &http,
+            prompt: &Answer("yes"),
+        };
+
+        let error = disable(&project, &realm, "greeter", true)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("crossing between Shards"), "{error}");
+        assert!(error.contains("Nothing was moved"), "{error}");
+        assert_eq!(
+            teardown_calls(&http).len(),
+            1,
+            "teardown stops at the first Refusal"
+        );
+        assert!(project.packages_dir().join("greeter").is_dir());
+    }
+
+    #[test]
+    fn an_answer_other_than_yes_tears_down_nothing_and_moves_nothing() {
+        let tmp = TempDir::new().unwrap();
+        let project = checkout(&tmp);
+        installed(&tmp, &project, "greeter");
+        with_stack(&project);
+        let stack = FakeStack::new();
+        let runner = stack.runner();
+        let http = FakeHttp::new();
+        let realm = Realm {
+            runner: &runner,
+            http: &http,
+            prompt: &Answer("no"),
+        };
+
+        assert!(disable(&project, &realm, "greeter", false).is_err());
+
+        assert!(teardown_calls(&http).is_empty());
+        assert!(project.packages_dir().join("greeter").is_dir());
+    }
+
+    /// Install `name` from a folder outside the checkout, the way an operator would, so every
+    /// lifecycle test starts from a real stamped Package rather than a hand-built directory.
+    fn installed(tmp: &TempDir, project: &ProjectLayout, name: &str) {
+        let source = candidate(tmp, name);
+        add(
+            project,
+            &FakeStack::new().runner(),
+            &Answer("yes"),
+            source.to_str().unwrap(),
+            true,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn disabling_moves_the_folder_out_of_the_build_and_enabling_moves_it_back() {
+        let tmp = TempDir::new().unwrap();
+        let project = checkout(&tmp);
+        installed(&tmp, &project, "greeter");
+        let enabled = project.packages_dir().join("greeter");
+        let disabled = project.packages_disabled_dir().join("greeter");
+
+        disable_without_stack(&project, "greeter").unwrap();
+
+        assert!(!enabled.exists(), "the build must not still see it");
+        assert!(disabled.join("src/mod.rs").is_file());
+        assert_eq!(
+            inventory(&project).unwrap()[0].state,
+            PackageState::Disabled
+        );
+
+        enable(&project, "greeter").unwrap();
+
+        assert!(enabled.join("src/mod.rs").is_file());
+        assert!(!disabled.exists());
+        assert_eq!(inventory(&project).unwrap()[0].state, PackageState::Enabled);
+    }
+
+    #[test]
+    fn a_move_carries_the_provenance_stamp_and_the_content_with_it() {
+        // The stamp lives inside the folder for exactly this reason. If a move rewrote or dropped
+        // it, a re-enabled Package would report itself as unrecorded or as locally drifted.
+        let tmp = TempDir::new().unwrap();
+        let project = checkout(&tmp);
+        installed(&tmp, &project, "greeter");
+        let before = ProvenanceStamp::read(&project.packages_dir().join("greeter")).unwrap();
+
+        disable_without_stack(&project, "greeter").unwrap();
+        let disabled = project.packages_disabled_dir().join("greeter");
+        assert_eq!(ProvenanceStamp::read(&disabled), Some(before.clone()));
+        assert_eq!(
+            stamp::content_identity(&disabled).unwrap(),
+            before.content_identity,
+            "a disabled Package must not read as locally drifted"
+        );
+
+        enable(&project, "greeter").unwrap();
+        let enabled = project.packages_dir().join("greeter");
+        assert_eq!(ProvenanceStamp::read(&enabled), Some(before.clone()));
+        assert_eq!(
+            stamp::content_identity(&enabled).unwrap(),
+            before.content_identity
+        );
+    }
+
+    #[test]
+    fn enabling_a_name_the_enabled_inventory_folds_onto_moves_nothing() {
+        // `packages/foo-bar` and a disabled `foo_bar` both generate `pkg_foo_bar`. The destination
+        // paths differ, so only the fold check catches this.
+        let tmp = TempDir::new().unwrap();
+        let project = checkout(&tmp);
+        std::fs::create_dir_all(project.packages_dir().join("foo-bar/src")).unwrap();
+        let disabled = project.packages_disabled_dir().join("foo_bar");
+        std::fs::create_dir_all(disabled.join("src")).unwrap();
+
+        let error = enable(&project, "foo_bar").unwrap_err();
+
+        assert_eq!(error.exit_code(), crate::error::EXIT_USAGE, "{error}");
+        assert!(error.to_string().contains("pkg_foo_bar"), "{error}");
+        assert!(disabled.is_dir(), "nothing may move: {error}");
+        assert!(!project.packages_dir().join("foo_bar").exists(), "{error}");
+    }
+
+    #[test]
+    fn a_package_that_is_already_in_the_destination_state_is_refused() {
+        let tmp = TempDir::new().unwrap();
+        let project = checkout(&tmp);
+        installed(&tmp, &project, "greeter");
+
+        let error = enable(&project, "greeter").unwrap_err();
+        assert!(error.to_string().contains("already enabled"), "{error}");
+
+        disable_without_stack(&project, "greeter").unwrap();
+        let error = disable_without_stack(&project, "greeter").unwrap_err();
+        assert!(error.to_string().contains("already disabled"), "{error}");
+    }
+
+    #[test]
+    fn an_unknown_name_names_the_folded_near_miss_rather_than_acting_on_it() {
+        let tmp = TempDir::new().unwrap();
+        let project = checkout(&tmp);
+        installed(&tmp, &project, "greeter");
+
+        let error = disable_without_stack(&project, "absent").unwrap_err();
+        assert!(error.to_string().contains("packages list"), "{error}");
+
+        std::fs::rename(
+            project.packages_dir().join("greeter"),
+            project.packages_dir().join("my-package"),
+        )
+        .unwrap();
+        let error = disable_without_stack(&project, "my_package").unwrap_err();
+        assert!(error.to_string().contains("'my-package'"), "{error}");
+        assert!(
+            project.packages_dir().join("my-package").is_dir(),
+            "the near miss must not be moved: {error}"
+        );
+    }
+
+    #[test]
+    fn disabling_a_package_with_tables_warns_about_publication_before_it_moves() {
+        let tmp = TempDir::new().unwrap();
+        let project = checkout(&tmp);
+        installed(&tmp, &project, "greeter");
+        let review = TrustReview::scan(&project.packages_dir().join("greeter")).unwrap();
+        assert_eq!(review.tables, ["pkg_greeter_log"], "fixture check");
+
+        let warning = table_warning(&PackageName::parse("greeter").unwrap(), &review.tables);
+
+        assert!(warning.contains("pkg_greeter_log"), "{warning}");
+        assert!(warning.contains("still holding rows"), "{warning}");
+        // Informs, never blocks: the move itself must still happen.
+        disable_without_stack(&project, "greeter").unwrap();
+        assert!(project.packages_disabled_dir().join("greeter").is_dir());
+    }
+
+    #[test]
+    fn removing_deletes_a_confirmed_disabled_package_and_nothing_else() {
+        let tmp = TempDir::new().unwrap();
+        let project = checkout(&tmp);
+        installed(&tmp, &project, "greeter");
+        installed(&tmp, &project, "keeper");
+        let source = tmp.path().join("sources/greeter");
+        disable_without_stack(&project, "greeter").unwrap();
+
+        remove(&project, &Answer("yes"), "greeter", false).unwrap();
+
+        assert!(!project.packages_disabled_dir().join("greeter").exists());
+        assert!(
+            project.packages_dir().join("keeper/src/mod.rs").is_file(),
+            "removing one Package must not touch another"
+        );
+        assert!(
+            source.join("src/mod.rs").is_file(),
+            "the Package Source is not this command's to delete"
+        );
+    }
+
+    #[test]
+    fn removing_an_enabled_package_is_refused_and_points_at_disable() {
+        let tmp = TempDir::new().unwrap();
+        let project = checkout(&tmp);
+        installed(&tmp, &project, "greeter");
+
+        let error = remove(&project, &Answer("yes"), "greeter", true).unwrap_err();
+
+        assert_eq!(error.exit_code(), crate::error::EXIT_USAGE, "{error}");
+        assert!(
+            error.to_string().contains("packages disable greeter"),
+            "{error}"
+        );
+        assert!(project.packages_dir().join("greeter").is_dir(), "{error}");
+    }
+
+    #[test]
+    fn removing_a_locally_changed_package_is_refused_before_the_question_is_asked() {
+        let tmp = TempDir::new().unwrap();
+        let project = checkout(&tmp);
+        installed(&tmp, &project, "greeter");
+        disable_without_stack(&project, "greeter").unwrap();
+        let disabled = project.packages_disabled_dir().join("greeter");
+        std::fs::write(disabled.join("src/mod.rs"), "// hours of local work\n").unwrap();
+
+        // `--yes`, so a refusal cannot be the prompt's doing: the drift check is what stops it.
+        let error = remove(&project, &Answer("yes"), "greeter", true).unwrap_err();
+
+        assert_eq!(error.exit_code(), crate::error::EXIT_USAGE, "{error}");
+        assert!(error.to_string().contains("no longer matches"), "{error}");
+        assert!(disabled.join("src/mod.rs").is_file(), "{error}");
+    }
+
+    #[test]
+    fn removing_a_package_with_no_recorded_identity_is_refused() {
+        // A folder somebody dropped into the inventory by hand: nothing says which of its bytes
+        // were ever installed from anywhere, so all of them have to be treated as local work.
+        let tmp = TempDir::new().unwrap();
+        let project = checkout(&tmp);
+        let handmade = project.packages_disabled_dir().join("handmade");
+        std::fs::create_dir_all(handmade.join("src")).unwrap();
+        std::fs::write(handmade.join("src/mod.rs"), "pub fn helper() {}\n").unwrap();
+
+        let error = remove(&project, &Answer("yes"), "handmade", true).unwrap_err();
+
+        assert!(error.to_string().contains("provenance stamp"), "{error}");
+        assert!(
+            error.to_string().contains(&shell_quote(&handmade)),
+            "the by-hand remedy must name the exact path: {error}"
+        );
+        assert!(handmade.join("src/mod.rs").is_file(), "{error}");
+    }
+
+    #[test]
+    fn an_answer_other_than_yes_deletes_nothing() {
+        let tmp = TempDir::new().unwrap();
+        let project = checkout(&tmp);
+        installed(&tmp, &project, "greeter");
+        disable_without_stack(&project, "greeter").unwrap();
+        let disabled = project.packages_disabled_dir().join("greeter");
+
+        let error = remove(&project, &Answer("no"), "greeter", false).unwrap_err();
+
+        assert_eq!(error.exit_code(), crate::error::EXIT_USAGE, "{error}");
+        assert!(error.to_string().contains("Nothing was deleted"), "{error}");
+        assert!(disabled.join("src/mod.rs").is_file(), "{error}");
+    }
+
+    #[test]
+    fn recovery_note_names_the_local_folder_unchanged() {
+        let local = ProvenanceStamp::local(Path::new("/home/dev/src/greeter"), String::new(), 0);
+        assert_eq!(
+            recovery_note(&PackageName::parse("greeter").unwrap(), Some(&local)),
+            "This command does not touch the Package Source it was installed from, so it can \
+             be\ninstalled again with:\n      lyracore packages add '/home/dev/src/greeter'\n"
+        );
+    }
+
+    #[test]
+    fn recovery_note_names_the_git_package_source_and_recorded_revision() {
+        let git = ProvenanceStamp::git(
+            "https://example.test/greeter.git",
+            "1a2b3c4d5e6f".to_string(),
+            String::new(),
+            0,
+        );
+        let note = recovery_note(&PackageName::parse("greeter").unwrap(), Some(&git));
+
+        assert!(note.contains("Git Package Source"), "{note}");
+        assert!(note.contains("https://example.test/greeter.git"), "{note}");
+        assert!(note.contains("revision 1a2b3c4d5e6f"), "{note}");
+        assert!(
+            note.contains("lyracore packages add 'https://example.test/greeter.git'"),
+            "{note}"
+        );
+    }
+
+    #[test]
+    fn recovery_note_names_the_official_package_source_and_bare_package_name() {
+        let official = ProvenanceStamp::official(
+            "https://github.com/LyraCoreProject/packages",
+            "1a2b3c4d5e6f".to_string(),
+            String::new(),
+            0,
+        );
+        let note = recovery_note(&PackageName::parse("greeter").unwrap(), Some(&official));
+
+        assert!(note.contains("Official Package Source"), "{note}");
+        assert!(
+            note.contains("https://github.com/LyraCoreProject/packages"),
+            "{note}"
+        );
+        assert!(note.contains("revision 1a2b3c4d5e6f"), "{note}");
+        assert!(note.contains("lyracore packages add greeter"), "{note}");
+    }
+
+    #[test]
+    fn recovery_note_is_final_for_missing_or_unknown_package_sources() {
+        let missing_kind = ProvenanceStamp {
+            source: "somewhere".to_string(),
+            ..Default::default()
+        };
+        let unknown = ProvenanceStamp {
+            source_kind: "unknown".to_string(),
+            source: "somewhere".to_string(),
+            ..Default::default()
+        };
+
+        // A scaffold was copied out of this checkout and renamed. Re-adding it would not bring
+        // back the Package that is being deleted.
+        let scaffold =
+            ProvenanceStamp::scaffolded("example-script", "abcdef".to_string(), String::new(), 0);
+        let name = PackageName::parse("greeter").unwrap();
+        assert!(recovery_note(&name, Some(&scaffold)).contains("final"));
+        assert!(recovery_note(&name, Some(&missing_kind)).contains("final"));
+        assert!(recovery_note(&name, Some(&unknown)).contains("final"));
+        assert!(recovery_note(&name, None).contains("final"));
+    }
+
+    #[test]
+    fn no_lifecycle_verb_publishes_or_synchronizes_a_client() {
+        // The whole surface, driven end to end: every remaining step is PRINTED, never run. These
+        // commands take no ProcessRunner at all, which is the structural half of that promise;
+        // this pins the behavioural half.
+        let tmp = TempDir::new().unwrap();
+        let project = checkout(&tmp);
+        let stack = FakeStack::new();
+        let source = candidate(&tmp, "greeter");
+        add(
+            &project,
+            &stack.runner(),
+            &Answer("yes"),
+            source.to_str().unwrap(),
+            true,
+        )
+        .unwrap();
+        let calls_after_add = stack.rendered().len();
+
+        disable_without_stack(&project, "greeter").unwrap();
+        enable(&project, "greeter").unwrap();
+        disable_without_stack(&project, "greeter").unwrap();
+        remove(&project, &Answer("yes"), "greeter", true).unwrap();
+
+        assert_eq!(
+            stack.rendered().len(),
+            calls_after_add,
+            "a lifecycle verb ran a process: {:?}",
+            stack.rendered()
+        );
+    }
+}

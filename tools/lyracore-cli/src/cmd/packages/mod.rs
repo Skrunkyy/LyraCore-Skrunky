@@ -1,0 +1,1985 @@
+//! `lyracore packages add <folder|git-url|name>`, `lyracore packages new <name>`, `lyracore
+//! packages list`, the lifecycle verbs in [`lifecycle`] (`enable`, `disable`, `remove`), the Git
+//! Package Source verbs in [`git`] (the URL form of `add` and all `update` forms), the Official
+//! Package Collection form of `add` in [`official`] (the bare-name form), and the two verbs that
+//! reach a running Realm: [`apply`] (a Package's Delta) and [`config`] (a Package's key-values).
+//!
+//! A Package is a drop-in folder under `packages/<name>/` that the server build compiles into the
+//! module with no core-file edits: `module/build.rs` discovers it, generates `pub mod pkg_<name>`
+//! for its `src/mod.rs`, and registers every marker it finds. `importer --pack-client` picks up its
+//! `client/` half the same way. Installing one is therefore not a configuration change — it is
+//! adding trusted code to the realm — so `add` shows a deterministic inventory of what it registers
+//! and asks before it copies anything. `new` copies from inside the checkout itself (the reference
+//! Package), so there is nothing external to review or ask about.
+//!
+//! COPY, NEVER SYMLINK. A symlinked Package would compile from a folder outside the checkout, so
+//! `preflight`, `publish` and `client sync` would each read whatever that folder happened to say at
+//! the time. The copy is the installed Package; the folder it came from is only its Package Source.
+//! `packages list` reports the two drifting apart.
+//!
+//! WHERE PACKAGES LIVE: enabled ones in `packages/` (what the build reads), disabled ones in
+//! `.lyracore/packages-disabled/` (git-ignored local state the build cannot see). The location IS
+//! the enabled state, which is why [`lifecycle`] can implement `enable` and `disable` as one
+//! rename. `add`, `new` and `list` only have to know that BOTH are inventories a new name must not
+//! collide with — an installed name that reappears when a Package is re-enabled is a collision the
+//! operator would meet much later, holding two folders and no way to tell which one the build
+//! compiled.
+
+pub mod apply;
+pub mod artifact;
+pub mod build;
+pub mod check;
+pub mod config;
+pub mod git;
+pub mod identity;
+pub mod lifecycle;
+pub(crate) mod official;
+pub mod review;
+pub mod script;
+pub mod stamp;
+pub(crate) mod tree;
+
+use crate::cmd::import::Prompt;
+use crate::cmd::preflight;
+use crate::proc::{CommandSpec, ProcessRunner};
+use crate::project::{Component, ProjectLayout, Topology};
+use crate::state::RuntimeState;
+use crate::{Error, Result};
+use review::TrustReview;
+use stamp::ProvenanceStamp;
+use std::path::{Path, PathBuf};
+
+/// Every database of the recorded development topology — what a `packages` verb means when no Shard
+/// is named, and exactly how `publish` resolves the same absence.
+///
+/// A checkout that has never run `dev up` has recorded nothing, and the default fixture is sharded.
+/// This is deliberately the only topology source these verbs have: there is no path here that
+/// infers a production Realm's Shard list.
+pub(crate) fn recorded_databases(project: &ProjectLayout) -> Result<Vec<String>> {
+    let state = RuntimeState::load(&project.state_file())?;
+    let topology = if state.record(Component::Gateway).is_some() {
+        state.topology()
+    } else {
+        Topology::Sharded
+    };
+    Ok(topology
+        .databases()
+        .into_iter()
+        .map(str::to_string)
+        .collect())
+}
+
+/// Shard names for a report line, with an explicit word for none of them.
+pub(crate) fn shard_list(shards: &[String]) -> String {
+    if shards.is_empty() {
+        "(none)".to_string()
+    } else {
+        shards.join(" ")
+    }
+}
+
+/// The default Reference Package needs no Rust.
+pub const DEFAULT_REFERENCE: &str = "example-script";
+const REFERENCE_PACKAGES: &[&str] = &[
+    "example-script",
+    "example-client",
+    "example-data",
+    "example-rust",
+    "example-all",
+];
+
+/// A Package folder name the server build will accept.
+///
+/// The rule is `module/build.rs::package_ident()`, mirrored exactly rather than approximated: the
+/// build maps `my-package` onto the Rust module `pkg_my_package` and PANICS on a name that does not
+/// map cleanly. A name this CLI accepted and that build refused would be an install that only fails
+/// at the next `preflight`, with a build-script panic naming a folder the operator did not create
+/// by hand.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct PackageName(String);
+
+impl PackageName {
+    pub fn parse(raw: &str) -> Result<Self> {
+        let valid = !raw.is_empty()
+            && raw.starts_with(|c: char| c.is_ascii_alphabetic())
+            && raw
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+        if !valid {
+            return Err(Error::Usage(format!(
+                "'{raw}' is not a usable Package name. A Package folder becomes the Rust module \
+                 `pkg_<name>` in the module wasm, so the name must start with a letter and hold \
+                 only letters, digits, '_' and '-' (the server build panics on anything else)."
+            )));
+        }
+        Ok(Self(raw.to_string()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// The Rust module suffix the build derives: hyphens fold to underscores. TWO names that fold
+    /// to the same identifier cannot be installed together — the generated `pkg_<ident>` modules
+    /// would collide — which is why collision checks compare this and not the folder name.
+    pub fn rust_ident(&self) -> String {
+        self.0.replace('-', "_")
+    }
+}
+
+/// Which inventory a Package is in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PackageState {
+    /// Under `packages/` — compiled into the module by the next `preflight`/`publish`.
+    Enabled,
+    /// Under `.lyracore/packages-disabled/` — kept, but invisible to the build.
+    Disabled,
+}
+
+impl PackageState {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            PackageState::Enabled => "enabled",
+            PackageState::Disabled => "disabled",
+        }
+    }
+}
+
+/// One Package on disk, from either inventory.
+#[derive(Debug, Clone)]
+pub struct InstalledPackage {
+    pub name: PackageName,
+    pub state: PackageState,
+    pub dir: PathBuf,
+    /// `None` for a Package created by hand or one that predates `packages add`.
+    pub stamp: Option<ProvenanceStamp>,
+}
+
+/// Every installed Package, enabled then disabled, each set sorted by name.
+///
+/// A folder whose name the build would refuse is still listed — it exists, and refusing to mention
+/// it would hide the one thing that explains the build failure it causes. Its name is reported
+/// verbatim.
+pub fn inventory(project: &ProjectLayout) -> Result<Vec<InstalledPackage>> {
+    let mut installed = Vec::new();
+    for (state, root) in [
+        (PackageState::Enabled, project.packages_dir()),
+        (PackageState::Disabled, project.packages_disabled_dir()),
+    ] {
+        if !root.is_dir() {
+            continue;
+        }
+        let mut dirs = Vec::new();
+        for result in std::fs::read_dir(&root)? {
+            let entry = result?;
+            let file_type = entry.file_type()?;
+            if file_type.is_symlink() {
+                return Err(Error::State(format!(
+                    "{} is a linked Package in the {} inventory. Refusing to follow it outside \
+                     the checkout; replace it with an ordinary copied directory.",
+                    entry.path().display(),
+                    state.as_str()
+                )));
+            }
+            if file_type.is_dir() {
+                dirs.push(entry.path());
+            }
+        }
+        dirs.sort();
+        for dir in dirs {
+            let raw = dir.file_name().unwrap_or_default().to_string_lossy();
+            installed.push(InstalledPackage {
+                name: PackageName::parse(&raw).unwrap_or(PackageName(raw.into_owned())),
+                state,
+                stamp: ProvenanceStamp::read(&dir),
+                dir,
+            });
+        }
+    }
+    Ok(installed)
+}
+
+/// The Package either inventory already holds under `name`'s generated module identifier, if any.
+///
+/// `ignoring` is the directory of a Package that is only being MOVED between the inventories: it is
+/// still in the one it is leaving, so without this it would collide with itself.
+pub(crate) fn collision(
+    project: &ProjectLayout,
+    name: &PackageName,
+    ignoring: Option<&Path>,
+) -> Result<Option<InstalledPackage>> {
+    let ident = name.rust_ident();
+    Ok(inventory(project)?.into_iter().find(|existing| {
+        existing.name.rust_ident() == ident && Some(existing.dir.as_path()) != ignoring
+    }))
+}
+
+/// Why `existing` blocks `name`: the same folder name, or a different spelling of it that the build
+/// folds onto the same generated module.
+pub(crate) fn collision_reason(existing: &InstalledPackage, name: &PackageName) -> String {
+    if existing.name == *name {
+        format!(
+            "a {} Package is already called '{}'",
+            existing.state.as_str(),
+            existing.name.as_str()
+        )
+    } else {
+        format!(
+            "the {} Package '{}' already folds onto the same module `pkg_{}` ('-' and '_' are the \
+             same character to the build)",
+            existing.state.as_str(),
+            existing.name.as_str(),
+            name.rust_ident()
+        )
+    }
+}
+
+/// Refuse a name either inventory already holds, comparing the Rust identifiers the build derives
+/// rather than the folder names.
+pub fn check_collision(project: &ProjectLayout, name: &PackageName) -> Result<()> {
+    match collision(project, name, None)? {
+        Some(existing) => Err(Error::Usage(format!(
+            "cannot install '{}': {}. It is at {}. Nothing was copied.",
+            name.as_str(),
+            collision_reason(&existing, name),
+            existing.dir.display()
+        ))),
+        None => Ok(()),
+    }
+}
+
+/// Refuse a destination `packages/<name>` that Git already tracks in the core checkout: a
+/// first-party Package like the Reference Package (`example`) or an in-tree instance Package
+/// (`fire_nova`). Installing over one would overwrite tracked content outside any Package
+/// Inventory move, dirtying the checkout. `lyracore update` and `service reconcile` then refuse to
+/// run against a dirty tree.
+fn check_not_tracked(
+    project: &ProjectLayout,
+    runner: &dyn ProcessRunner,
+    name: &PackageName,
+    source: &str,
+) -> Result<()> {
+    let relative = format!("{}/{}", ProjectLayout::PACKAGES_DIR, name.as_str());
+    let tracked = runner.run_and_wait(
+        &CommandSpec::new("git")
+            .cwd(project.root.clone())
+            .arg("ls-files")
+            .arg("--")
+            .arg(&relative),
+    )?;
+    if tracked.trim().is_empty() {
+        return Ok(());
+    }
+    Err(Error::Usage(format!(
+        "cannot install '{}' from {}: {} is already tracked by Git in this checkout. Installing \
+         over a tracked Package would dirty the checkout, and `lyracore update` and `service \
+         reconcile` then refuse to run. Nothing was copied.",
+        name.as_str(),
+        source,
+        project.root.join(&relative).display()
+    )))
+}
+
+/// A Package carries Rust, client files, generated data or authoring scripts.
+/// If it carries Rust, `src/mod.rs` is its required root.
+pub fn validate_shape(source: &Path) -> Result<()> {
+    let has_src = source.join("src").is_dir();
+    let has_other_half = ["client", "data", "scripts", "datascripts"]
+        .iter()
+        .any(|name| source.join(name).is_dir());
+    if !has_src && !has_other_half {
+        return Err(Error::Usage(format!(
+            "{} is not a Package: it needs src/, client/, data/, scripts/ or datascripts/.",
+            source.display()
+        )));
+    }
+    if has_src && !source.join("src").join("mod.rs").is_file() {
+        return Err(Error::Usage(format!(
+            "{}/src/ has no mod.rs. A Package's Rust root must be src/mod.rs — the server build \
+             refuses any other spelling rather than skipping the Package silently.",
+            source.display()
+        )));
+    }
+    Ok(())
+}
+
+// =============================================================================================
+//  `packages add`
+// =============================================================================================
+
+/// Install a Package from a folder on this machine, a Git Package Source, or the Official Package
+/// Collection.
+///
+/// The argument decides which, in this order: a Git URL is cloned first, and everything after that
+/// is the same contract a local folder goes through. Anything else that already names a real path
+/// on this machine — including a bare word that happens to be a local directory — is that local
+/// folder, unchanged. Only what is left, a bare word that is a usable Package name and names
+/// nothing here, is looked up in the Official Package Collection.
+pub fn add(
+    project: &ProjectLayout,
+    runner: &dyn ProcessRunner,
+    prompt: &dyn Prompt,
+    source: &str,
+    yes: bool,
+) -> Result<()> {
+    match git::GitSource::parse(source) {
+        Some(repository) => git::add(project, runner, prompt, &repository, yes),
+        None => match official_candidate(source, Path::new(source).exists()) {
+            Some(name) => official::add(project, runner, prompt, &name, yes),
+            None => add_folder(project, runner, prompt, source, yes),
+        },
+    }
+}
+
+/// `source` is an Official Package Collection candidate exactly when it is a usable Package name
+/// that nothing on this machine already answers to. `exists_locally` is a parameter rather than a
+/// filesystem check made here so the rule reads and tests the same way regardless of what is on
+/// disk: a path with a `/`, a leading `.` or `~`, or anything else [`PackageName::parse`] refuses
+/// is never a candidate either way, and a bare word that IS a local directory keeps its existing
+/// folder resolution rather than being shadowed by the collection.
+fn official_candidate(source: &str, exists_locally: bool) -> Option<PackageName> {
+    if exists_locally {
+        return None;
+    }
+    PackageName::parse(source).ok()
+}
+
+/// Install a local folder as an enabled Package.
+fn add_folder(
+    project: &ProjectLayout,
+    runner: &dyn ProcessRunner,
+    prompt: &dyn Prompt,
+    source: &str,
+    yes: bool,
+) -> Result<()> {
+    let source = std::fs::canonicalize(source).map_err(|e| {
+        Error::Usage(format!(
+            "cannot read the folder to install: {source} ({e}). `packages add` takes a path to a \
+             Package folder on this machine, the URL of a repository whose root is one Package, \
+             or (a bare word only) a name to resolve against the Official Package Collection — \
+             and '{source}' is not a usable Package name."
+        ))
+    })?;
+    if !source.is_dir() {
+        return Err(Error::Usage(format!(
+            "{} is a file. `packages add` takes the Package FOLDER — the one holding src/ and/or \
+             client/.",
+            source.display()
+        )));
+    }
+
+    let name = PackageName::parse(&source.file_name().unwrap_or_default().to_string_lossy())?;
+
+    if source.starts_with(project.packages_dir())
+        || source.starts_with(project.packages_disabled_dir())
+    {
+        return Err(Error::Usage(format!(
+            "{} is already inside this checkout's Package inventory. `packages add` installs a \
+             folder from elsewhere on this machine.",
+            source.display()
+        )));
+    }
+    let destination = project.packages_dir().join(name.as_str());
+    if destination.starts_with(&source) {
+        return Err(Error::Usage(format!(
+            "cannot install {} into {} because the destination is inside the folder being copied. \
+             Choose the Package folder itself, not an ancestor of this checkout. Nothing was \
+             copied.",
+            source.display(),
+            destination.display()
+        )));
+    }
+    install(
+        project,
+        runner,
+        prompt,
+        &source,
+        &name,
+        &Origin::Local(&source),
+        yes,
+    )
+}
+
+/// Where a Package came from: what the install records in its stamp, and what it prints.
+///
+/// The two kinds differ only here. A cloned repository and a local folder are both a reviewed tree
+/// on this machine by the time [`install`] sees them, so `add` has one path rather than two that
+/// drift apart.
+pub(crate) enum Origin<'a> {
+    Local(&'a Path),
+    Git { url: &'a str, revision: &'a str },
+    Official { revision: &'a str },
+}
+
+impl Origin<'_> {
+    fn stamp(&self, content_identity: String) -> ProvenanceStamp {
+        match self {
+            Origin::Local(folder) => {
+                ProvenanceStamp::local(folder, content_identity, stamp::now_unix())
+            }
+            Origin::Git { url, revision } => ProvenanceStamp::git(
+                url,
+                (*revision).to_string(),
+                content_identity,
+                stamp::now_unix(),
+            ),
+            Origin::Official { revision } => ProvenanceStamp::official(
+                official::COLLECTION_URL,
+                (*revision).to_string(),
+                content_identity,
+                stamp::now_unix(),
+            ),
+        }
+    }
+
+    /// The source lines of the install report, in the same shape `packages list` prints them (see
+    /// [`provenance_report`]) — minus the `installed` line, which an install has not recorded yet
+    /// at either point this is called.
+    fn report(&self) -> String {
+        match self {
+            Origin::Local(folder) => {
+                source_and_revision(stamp::SOURCE_LOCAL, &folder.display().to_string(), "")
+            }
+            Origin::Git { url, revision } => source_and_revision(stamp::SOURCE_GIT, url, revision),
+            Origin::Official { revision } => {
+                source_and_revision(stamp::SOURCE_OFFICIAL, official::COLLECTION_URL, revision)
+            }
+        }
+    }
+
+    /// The Package Source as the operator recognises it, for the one sentence they answer. Never a
+    /// scratch-clone path: a Git Package Source names the URL it was cloned from, and an Official
+    /// Package Source names the collection, not the directory `add` cloned it into.
+    fn named(&self) -> String {
+        match self {
+            Origin::Local(folder) => folder.display().to_string(),
+            Origin::Git { url, .. } => (*url).to_string(),
+            Origin::Official { .. } => {
+                format!(
+                    "the Official Package Collection ({})",
+                    official::COLLECTION_URL
+                )
+            }
+        }
+    }
+}
+
+/// The installation contract, from the first refusal to the printed next steps.
+///
+/// Order matters and is the whole design: everything that can refuse the install does so BEFORE
+/// anything is copied, the operator sees the trust review before they are asked, and preflight runs
+/// after the copy because it is the first check that can see the Package compiled in. Publishing is
+/// never part of this command — the module on the node is unchanged until the operator runs
+/// `lyracore publish` themselves.
+pub(crate) fn install(
+    project: &ProjectLayout,
+    runner: &dyn ProcessRunner,
+    prompt: &dyn Prompt,
+    source: &Path,
+    name: &PackageName,
+    origin: &Origin,
+    yes: bool,
+) -> Result<()> {
+    let destination = project.packages_dir().join(name.as_str());
+    check_not_tracked(project, runner, name, &origin.named())?;
+    check_collision(project, name)?;
+    // Computing the identity validates the WHOLE tree (including client content) before the
+    // narrower shape and trust-review passes. The same identity must describe the staged copy
+    // after the operator answers, binding consent to the bytes that are actually installed.
+    let reviewed_identity = stamp::content_identity(source)?;
+    validate_shape(source)?;
+
+    let review = TrustReview::scan(source)?;
+    println!();
+    print!("{}", review.render(source));
+    // The review header names the tree it scanned, which for a clone is a scratch directory the
+    // operator never typed. The Package Source is what they chose and what they must recognise
+    // before they answer, so it is repeated here and in the question itself.
+    println!();
+    print!("{}", origin.report());
+    println!();
+
+    confirm(
+        prompt,
+        &format!(
+            "Install '{}' from {} into {}?",
+            name.as_str(),
+            origin.named(),
+            destination.display()
+        ),
+        "Nothing was copied.",
+        yes,
+    )?;
+
+    let identity = install_tree(
+        project,
+        name,
+        source,
+        &reviewed_identity,
+        origin,
+        &destination,
+    )?;
+    println!();
+    println!("installed {} -> {}", name.as_str(), destination.display());
+    print!("{}", origin.report());
+    println!("  identity  {identity}");
+
+    println!();
+    println!("running preflight with the Package compiled in");
+    preflight::run(project, runner).map_err(|e| {
+        Error::Process(format!(
+            "preflight failed with '{}' installed, so it has NOT been published and the module on \
+             the node is unchanged.\n  The Package is on disk at {}. Fix it there and re-run \
+             `lyracore preflight`, or undo the install with:\n      rm -rf -- {}\n  ({e})",
+            name.as_str(),
+            destination.display(),
+            shell_quote(&destination)
+        ))
+    })?;
+
+    println!();
+    println!("'{}' is installed and preflight is green.", name.as_str());
+    print!("{}", activation_steps(&destination));
+    Ok(())
+}
+
+/// Copy a reviewed tree into `destination` as a stamped Package, or leave nothing behind. Returns
+/// the content identity that was recorded.
+///
+/// `reviewed` is the identity the operator was shown. A tree that no longer hashes to it is refused
+/// rather than installed, which is what binds consent to the bytes that land in the inventory. The
+/// copy is staged outside both inventories and moved in with a no-replace rename, so a destination
+/// that appeared meanwhile is never merged into or overwritten.
+pub(crate) fn install_tree(
+    project: &ProjectLayout,
+    name: &PackageName,
+    source: &Path,
+    reviewed: &str,
+    origin: &Origin,
+    destination: &Path,
+) -> Result<String> {
+    let mut staged = StagedPackage::new(project, name)?;
+    copy_tree(source, staged.path())?;
+    let identity = stamp::content_identity(staged.path())?;
+    if identity != reviewed {
+        return Err(Error::Process(format!(
+            "the Package Source changed after its trust review (reviewed {reviewed}, copied \
+             {identity}). Nothing was installed; review the current source and run the command \
+             again."
+        )));
+    }
+    origin.stamp(identity.clone()).write(staged.path())?;
+    // Recheck after the prompt and potentially long copy. A concurrent install must not be merged
+    // with or overwritten by this one.
+    let _claim = PackageClaim::acquire(project, name)?;
+    check_collision(project, name)?;
+    staged.install(destination)?;
+    Ok(identity)
+}
+
+/// The one installed Package with this exact folder name, from either inventory.
+///
+/// Exact, not folded: these commands act on a FOLDER, and picking a near-miss for the operator
+/// would change a directory they did not name. A fold-equal Package is named in the error instead,
+/// because it is almost always the one they meant.
+pub(crate) fn find(project: &ProjectLayout, name: &PackageName) -> Result<InstalledPackage> {
+    let mut folded = None;
+    for installed in inventory(project)? {
+        if installed.name == *name {
+            return Ok(installed);
+        }
+        if installed.name.rust_ident() == name.rust_ident() {
+            folded = Some(installed);
+        }
+    }
+    Err(Error::Usage(match folded {
+        Some(near) => format!(
+            "no Package called '{}'. The {} Package '{}' folds onto the same module `pkg_{}`, but \
+             these commands act on a folder, so its name has to be typed exactly. Nothing was \
+             changed.",
+            name.as_str(),
+            near.state.as_str(),
+            near.name.as_str(),
+            name.rust_ident()
+        ),
+        None => format!(
+            "no Package called '{}'. `lyracore packages list` shows every installed Package in \
+             both inventories. Nothing was changed.",
+            name.as_str()
+        ),
+    }))
+}
+
+/// The operator gate. Only the literal word 'yes' is consent; `--yes` answers it in advance.
+///
+/// `question` states the whole action and the path it happens to, because the sentence the operator
+/// answers is their last chance to see what is about to change. `unchanged` is what the refusal
+/// reports as still intact, which differs per command and is the half the operator cares about when
+/// they say no.
+pub(crate) fn confirm(
+    prompt: &dyn Prompt,
+    question: &str,
+    unchanged: &str,
+    yes: bool,
+) -> Result<()> {
+    if yes {
+        println!("Confirmed on the command line (--yes).");
+        return Ok(());
+    }
+    let answer = prompt.ask(&format!("{question} Type 'yes' to continue: "))?;
+    if !answer.eq_ignore_ascii_case("yes") {
+        return Err(Error::Usage(format!(
+            "stopping: the answer was {answer:?}, and only 'yes' is consent. {unchanged}"
+        )));
+    }
+    Ok(())
+}
+
+/// A staged Package outside the enabled inventory. Unless [`install`](Self::install) completes,
+/// dropping it removes the partial copy so a failed install cannot block the next attempt or enter
+/// a concurrent build.
+struct StagedPackage {
+    path: PathBuf,
+    installed: bool,
+}
+
+/// An interprocess lock for one generated Rust module identifier.
+///
+/// The final no-replace rename protects one folder spelling. This lock protects the wider build
+/// collision: `foo-bar` and `foo_bar` have different destinations but both generate
+/// `pkg_foo_bar`. Holding it across the last inventory check and rename makes that decision one
+/// atomic critical section across `packages add` and `packages new` processes.
+#[derive(Debug)]
+struct PackageClaim {
+    _file: std::fs::File,
+}
+
+impl PackageClaim {
+    fn acquire(project: &ProjectLayout, name: &PackageName) -> Result<Self> {
+        let root = project.state_dir.join("package-locks");
+        std::fs::create_dir_all(&root)?;
+        let path = root.join(format!("{}.lock", name.rust_ident()));
+        // The lock is the file's EXISTENCE and its exclusive hold, never its content, so an
+        // already-held lock file must be opened as it is. The hold itself comes from the platform
+        // seam (`flock` on Unix, an exclusive share mode on Windows).
+        let file = crate::platform::open_exclusive_lock(&path).map_err(|error| {
+            Error::Process(format!(
+                "another Package install is currently claiming module `pkg_{}` ({error}). Wait \
+                 for it to finish, then retry; nothing was installed by this process.",
+                name.rust_ident()
+            ))
+        })?;
+        Ok(Self { _file: file })
+    }
+}
+
+impl StagedPackage {
+    fn new(project: &ProjectLayout, name: &PackageName) -> Result<Self> {
+        let root = project.state_dir.join("package-installs");
+        std::fs::create_dir_all(&root)?;
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        let path = root.join(format!("{}-{}-{nonce}", name.as_str(), std::process::id()));
+        std::fs::create_dir(&path)?;
+        Ok(Self {
+            path,
+            installed: false,
+        })
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn install(&mut self, destination: &Path) -> Result<()> {
+        let parent = destination.parent().ok_or_else(|| {
+            Error::State(format!(
+                "Package destination {} has no parent directory",
+                destination.display()
+            ))
+        })?;
+        std::fs::create_dir_all(parent)?;
+        rename_no_replace(&self.path, destination).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::AlreadyExists {
+                Error::Usage(format!(
+                    "cannot install: {} appeared while the Package was being reviewed and copied. \
+                     Nothing was merged or overwritten.",
+                    destination.display()
+                ))
+            } else {
+                Error::Process(format!(
+                    "could not atomically install the staged Package at {} without overwriting an \
+                     existing path: {error}. Nothing was merged or overwritten.",
+                    destination.display()
+                ))
+            }
+        })?;
+        self.installed = true;
+        Ok(())
+    }
+}
+
+impl Drop for StagedPackage {
+    fn drop(&mut self) {
+        if !self.installed {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+}
+
+/// Move `from` onto `to`, never replacing whatever is already at `to`.
+///
+/// The guarantee both the staged install and the enable/disable moves need: an occupied destination
+/// must fail the whole operation rather than merge two Packages or overwrite one. Callers report
+/// `AlreadyExists` in their own words, because "the destination appeared while I was copying" and
+/// the "other inventory already holds this name" are different things to fix.
+fn rename_no_replace(from: &Path, to: &Path) -> std::io::Result<()> {
+    crate::platform::rename_no_replace(from, to)
+}
+
+/// Copy a validated Package tree file by file into a fresh staging directory.
+fn copy_tree(source: &Path, destination: &Path) -> Result<()> {
+    for entry in tree::collect(source)? {
+        let target = destination.join(&entry.relative);
+        match entry.kind {
+            tree::EntryKind::Directory => std::fs::create_dir(&target)?,
+            tree::EntryKind::File => {
+                std::fs::copy(&entry.path, &target)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn shell_quote(path: &Path) -> String {
+    format!("'{}'", path.to_string_lossy().replace('\'', "'\"'\"'"))
+}
+
+// =============================================================================================
+//  `packages new`
+// =============================================================================================
+
+/// Copy a Reference Package from the collection tag matching this checkout's Package API.
+/// Generated artifacts are omitted because renaming their source invalidates their Build Identity.
+pub fn new(
+    project: &ProjectLayout,
+    runner: &dyn ProcessRunner,
+    name: &str,
+    from: &str,
+) -> Result<()> {
+    let name = PackageName::parse(name)?;
+    if !REFERENCE_PACKAGES.contains(&from) {
+        return Err(Error::Usage(format!(
+            "unknown Reference Package '{from}'. Choose one of: {}",
+            REFERENCE_PACKAGES.join(", ")
+        )));
+    }
+    let reference_name = PackageName::parse(from)?;
+    check_collision(project, &name)?;
+    let collection = official::fetch(project, runner)?;
+    let reference = official::resolve(collection.path(), &reference_name)?;
+    stamp::content_identity(&reference)?;
+    validate_shape(&reference)?;
+    validate_scaffold_names(&reference, &name)?;
+
+    let destination = project.packages_dir().join(name.as_str());
+    let mut staged = StagedPackage::new(project, &name)?;
+    copy_tree(&reference, staged.path())?;
+    let script_ids = staged.path().join("script-ids.json");
+    if script_ids.is_file() {
+        std::fs::remove_file(script_ids)?;
+    }
+    let generated = staged.path().join("data/.generated");
+    if generated.is_dir() {
+        std::fs::remove_dir_all(generated)?;
+    }
+    rewrite_reference_name(staged.path(), &reference_name, &name)?;
+    let next_steps = scaffold_next_steps(staged.path());
+    std::fs::write(
+        staged.path().join("README.md"),
+        format!(
+            "# {}\n\nScaffolded from [{}]({}/tree/{}/{}) at the collection revision matching this \
+             checkout's Package API. Read that Reference Package for how its code works.\n\n\
+             This Package is already installed locally. Edit the source in this folder.\n\n{next_steps}",
+            name.as_str(), from, official::COLLECTION_URL, collection.revision(), from
+        ),
+    )?;
+    println!(
+        "{}",
+        review::TrustReview::scan(staged.path())?.render(&reference)
+    );
+
+    let identity = stamp::content_identity(staged.path())?;
+    ProvenanceStamp::scaffolded(
+        from,
+        collection.revision().to_string(),
+        identity.clone(),
+        stamp::now_unix(),
+    )
+    .write(staged.path())?;
+    let _claim = PackageClaim::acquire(project, &name)?;
+    check_collision(project, &name)?;
+    staged.install(&destination)?;
+    println!("scaffolded {} -> {}", name.as_str(), destination.display());
+    println!("  from      {from} in {}", official::COLLECTION_URL);
+    println!("  revision  {}", collection.revision());
+    println!("  identity  {identity}");
+
+    preflight::run(project, runner).map_err(|e| {
+        Error::Process(format!(
+            "preflight failed after '{}' was scaffolded. Nothing was published.\n  The Package \
+             remains at {}. Fix the reported cause and re-run `lyracore preflight`, or remove \
+             the scaffold with:\n      rm -rf -- {}\n  ({e})",
+            name.as_str(),
+            destination.display(),
+            shell_quote(&destination)
+        ))
+    })?;
+
+    println!("'{}' is scaffolded and preflight is green.", name.as_str());
+    print!("{next_steps}");
+    Ok(())
+}
+
+/// Artifact Package identities and Runtime Script names have stricter limits than Rust modules.
+fn validate_scaffold_names(reference: &Path, name: &PackageName) -> Result<()> {
+    let scripts = reference.join("scripts");
+    if !scripts.is_dir() && !reference.join("datascripts").is_dir() {
+        return Ok(());
+    }
+    if name.as_str().len() > 64 || name.as_str().bytes().any(|byte| byte.is_ascii_uppercase()) {
+        return Err(Error::Usage(format!(
+            "'{}' cannot name a Package artifact. Use at most 64 lowercase letters, digits, '-' or '_'. Nothing was installed.",
+            name.as_str()
+        )));
+    }
+    if scripts.is_dir() {
+        for entry in std::fs::read_dir(scripts)? {
+            let entry = entry?;
+            let path = entry.path();
+            if !entry.file_type()?.is_file()
+                || !matches!(
+                    path.extension().and_then(|part| part.to_str()),
+                    Some("ts" | "lua")
+                )
+            {
+                continue;
+            }
+            let stem = path
+                .file_stem()
+                .and_then(|part| part.to_str())
+                .ok_or_else(|| {
+                    Error::Usage(format!(
+                        "invalid Runtime Script filename: {}",
+                        path.display()
+                    ))
+                })?;
+            if name.as_str().len() + 1 + stem.len() > 64 {
+                return Err(Error::Usage(format!(
+                    "'{}.{stem}' exceeds the 64-character Runtime Script name limit. Choose a shorter Package name. Nothing was installed.",
+                    name.as_str()
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn activation_steps(package_dir: &Path) -> String {
+    let mut text = String::new();
+    if ["src", "scripts", "datascripts", "data"]
+        .iter()
+        .any(|dir| package_dir.join(dir).is_dir())
+    {
+        text.push_str("  lyracore packages apply   prepare and activate installed Packages on your development topology\n");
+    }
+    if package_dir.join("client").is_dir() {
+        text.push_str("  lyracore client sync      install enabled client content\n");
+    }
+    text
+}
+
+fn scaffold_next_steps(package_dir: &Path) -> String {
+    let mut text = String::new();
+    if package_dir.join("scripts").is_dir() || package_dir.join("datascripts").is_dir() {
+        text.push_str(
+            "Generated artifacts are omitted. `packages apply` builds the renamed sources.\n\n",
+        );
+    }
+    if package_dir.join("scripts").is_dir() {
+        text.push_str(
+            "`script-ids.json` is omitted. The Runtime Script Toolchain assigns new IDs. Commit \
+             it with the sources and Script Artifact.\n\n",
+        );
+    }
+    if package_dir.join("datascripts").is_dir() {
+        text.push_str(
+            "The Datascript needs your own client data. Choose distinct Package Spell IDs before \
+             using this copy beside another. Keep its generated Delta local.\n\n",
+        );
+    }
+    text.push_str(&activation_steps(package_dir));
+    text
+}
+
+/// Rename Package names, Rust identifiers and client filenames. Binary assets stay byte-identical.
+fn rewrite_reference_name(
+    destination: &Path,
+    reference: &PackageName,
+    name: &PackageName,
+) -> Result<()> {
+    let entries = tree::collect(destination)?;
+    for entry in &entries {
+        if entry.kind != tree::EntryKind::File || entry.relative == Path::new(stamp::STAMP_FILE) {
+            continue;
+        }
+        match std::fs::read_to_string(&entry.path) {
+            Ok(text) => {
+                let renamed = text
+                    .replace(&reference.rust_ident(), &name.rust_ident())
+                    .replace(reference.as_str(), name.as_str());
+                if text != renamed {
+                    std::fs::write(&entry.path, renamed)?;
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    // Rename children before their containing directory.
+    for entry in entries.into_iter().rev() {
+        let filename = entry
+            .path
+            .file_name()
+            .and_then(|part| part.to_str())
+            .ok_or_else(|| {
+                Error::State("Package traversal returned an invalid filename".to_string())
+            })?;
+        let renamed = filename.replace(reference.as_str(), name.as_str());
+        if filename != renamed {
+            let target = entry.path.with_file_name(renamed);
+            if target.exists() {
+                return Err(Error::Usage(format!(
+                    "renaming {} would overwrite {}",
+                    entry.path.display(),
+                    target.display()
+                )));
+            }
+            std::fs::rename(&entry.path, target)?;
+        }
+    }
+    Ok(())
+}
+
+// =============================================================================================
+//  `packages list`
+// =============================================================================================
+
+/// Report every installed Package: which inventory it is in, where it came from, what its content
+/// was when it was installed, whether it still matches, and what it registers.
+pub fn list(project: &ProjectLayout) -> Result<()> {
+    let installed = inventory(project)?;
+    if installed.is_empty() {
+        println!("no Packages installed.");
+        println!(
+            "`lyracore packages add <folder>` installs one from a folder on this machine, into {}.",
+            project.packages_dir().display()
+        );
+        return Ok(());
+    }
+
+    let enabled = installed
+        .iter()
+        .filter(|p| p.state == PackageState::Enabled)
+        .count();
+    println!(
+        "{} Package(s): {enabled} enabled, {} disabled",
+        installed.len(),
+        installed.len() - enabled
+    );
+
+    for package in &installed {
+        let identity = stamp::content_identity(&package.dir)?;
+        println!();
+        println!("{}  {}", package.name.as_str(), package.state.as_str());
+        print!("{}", provenance_report(package.stamp.as_ref()));
+        match &package.stamp {
+            Some(recorded) => print!("{}", identity_report(recorded, &identity)),
+            // Created by hand or installed before `packages add` existed. It is a real Package the
+            // build compiles; only its provenance is unknown.
+            None => println!("  identity  {identity}  (nothing recorded to compare against)"),
+        }
+        println!(
+            "  content   {}",
+            TrustReview::scan(&package.dir)?.kinds_summary()
+        );
+    }
+    Ok(())
+}
+
+/// Where a Package came from and when, as `packages list` and the lifecycle verbs both print it. A
+/// Package with no stamp says so rather than printing blank fields, and one with no revision (a
+/// local folder) leaves that line out rather than printing an empty one.
+pub(crate) fn provenance_report(stamp: Option<&ProvenanceStamp>) -> String {
+    match stamp {
+        Some(recorded) => format!(
+            "{}  installed {}\n",
+            source_and_revision(
+                blank_as_unrecorded(&recorded.source_kind),
+                blank_as_unrecorded(&recorded.source),
+                &recorded.revision,
+            ),
+            blank_as_unrecorded(&recorded.installed_at)
+        ),
+        None => "  source    (unrecorded — no provenance stamp: created by hand, or predates \
+                 `packages add`)\n"
+            .to_string(),
+    }
+}
+
+/// The `source` and `revision` lines shared by [`provenance_report`] and [`Origin::report`] —
+/// [`Origin::report`] has no `installed` line to append yet, and [`provenance_report`] appends its
+/// own after this.
+fn source_and_revision(kind: &str, source: &str, revision: &str) -> String {
+    format!(
+        "  source    {kind} {source}\n{}",
+        if revision.is_empty() {
+            String::new()
+        } else {
+            format!("  revision  {revision}\n")
+        }
+    )
+}
+
+fn drift(recorded: &ProvenanceStamp, current: &str) -> &'static str {
+    if recorded.content_identity.is_empty() {
+        "(the stamp records no identity to compare against)"
+    } else if recorded.content_identity == current {
+        "clean"
+    } else {
+        "LOCALLY DRIFTED — the installed copy no longer matches what was installed"
+    }
+}
+
+fn identity_report(recorded: &ProvenanceStamp, current: &str) -> String {
+    if recorded.content_identity.is_empty() {
+        format!(
+            "  identity  (unrecorded)  {}\n  current   {current}\n",
+            drift(recorded, current)
+        )
+    } else if recorded.content_identity == current {
+        format!("  identity  {}  clean\n", recorded.content_identity)
+    } else {
+        format!(
+            "  identity  {}  {}\n  current   {current}\n",
+            recorded.content_identity,
+            drift(recorded, current)
+        )
+    }
+}
+
+fn blank_as_unrecorded(value: &str) -> &str {
+    if value.is_empty() {
+        "(unrecorded)"
+    } else {
+        value
+    }
+}
+
+/// Fixtures shared with [`lifecycle`]'s tests, which start from a really installed Package rather
+/// than a hand-built directory.
+#[cfg(test)]
+pub(super) mod tests {
+    use super::*;
+    use crate::proc::fake::{FakeStack, FAKE_RUST_VERSION, FAKE_SPACETIME_VERSION};
+    use std::cell::Cell;
+    use tempfile::TempDir;
+
+    /// A checkout `preflight` passes in: the same fixture its own tests use, so an `add` test
+    /// exercises the real post-install gate rather than a stubbed one.
+    pub(super) fn checkout(tmp: &TempDir) -> ProjectLayout {
+        let root = tmp.path().join("checkout");
+        std::fs::create_dir_all(root.join("module/src")).unwrap();
+        std::fs::create_dir_all(root.join("scripts")).unwrap();
+        std::fs::write(root.join("Cargo.toml"), "[workspace]\n").unwrap();
+        std::fs::write(
+            root.join(ProjectLayout::RUST_TOOLCHAIN),
+            format!("[toolchain]\nchannel = \"{FAKE_RUST_VERSION}\"\n"),
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("module/Cargo.toml"),
+            format!(
+                "[dependencies]\nspacetimedb = {{ version = \"={FAKE_SPACETIME_VERSION}\" }}\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("module/src/lib.rs"),
+            "#[client_visibility_filter]\nconst CHARACTER_RLS: Filter =\n    \
+             Filter::Sql(\"SELECT * FROM game_character WHERE owner_identity = :sender\");\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join("docs")).unwrap();
+        std::fs::write(
+            root.join("docs/package-api.md"),
+            "# Package API, version 1\n",
+        )
+        .unwrap();
+        ProjectLayout::from_root(&root).unwrap()
+    }
+
+    /// A valid Rust Package folder outside the checkout.
+    pub(super) fn candidate(tmp: &TempDir, name: &str) -> PathBuf {
+        let dir = tmp.path().join("sources").join(name);
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(
+            dir.join("src/mod.rs"),
+            "#[spacetimedb::table(accessor = pkg_greeter_log)]\npub struct Log { pub id: u64 }\n\
+             game_hook!(on_login, fn greet(ctx, payload) { });\n",
+        )
+        .unwrap();
+        dir
+    }
+
+    /// A prompt that always gives one answer, so a test can drive the consent gate either way.
+    pub(super) struct Answer(pub(super) &'static str);
+    impl Prompt for Answer {
+        fn ask(&self, _question: &str) -> Result<String> {
+            Ok(self.0.to_string())
+        }
+    }
+
+    struct RecordingAnswer {
+        asked: Cell<bool>,
+    }
+
+    impl Prompt for RecordingAnswer {
+        fn ask(&self, _question: &str) -> Result<String> {
+            self.asked.set(true);
+            Ok("no".to_string())
+        }
+    }
+
+    struct MutatingAnswer {
+        file: PathBuf,
+    }
+
+    impl Prompt for MutatingAnswer {
+        fn ask(&self, _question: &str) -> Result<String> {
+            std::fs::write(&self.file, "pub fn code_the_operator_never_reviewed() {}\n")?;
+            Ok("yes".to_string())
+        }
+    }
+
+    // ---- the name contract, mirrored from module/build.rs ----
+
+    #[test]
+    fn a_name_is_usable_exactly_when_the_server_build_would_accept_it() {
+        // The rule is build.rs's `package_ident`: [a-zA-Z][a-zA-Z0-9_-]*. A name this CLI took and
+        // that build panicked on would be an install that breaks the next preflight.
+        for ok in ["greeter", "my-package", "my_package", "a", "pkg2"] {
+            assert!(PackageName::parse(ok).is_ok(), "{ok}");
+        }
+        for refused in [
+            "",
+            "2fast",
+            "-leading",
+            "_leading",
+            "has space",
+            "dot.name",
+            "üml",
+        ] {
+            let error = PackageName::parse(refused).unwrap_err();
+            assert_eq!(error.exit_code(), crate::error::EXIT_USAGE, "{refused}");
+        }
+    }
+
+    #[test]
+    fn hyphens_and_underscores_fold_onto_the_same_module() {
+        assert_eq!(
+            PackageName::parse("my-package").unwrap().rust_ident(),
+            "my_package"
+        );
+        assert_eq!(
+            PackageName::parse("my_package").unwrap().rust_ident(),
+            "my_package"
+        );
+    }
+
+    // ---- which bare words become an Official Package Collection lookup ----
+
+    #[test]
+    fn a_bare_name_is_an_official_candidate_only_when_nothing_local_answers_to_it() {
+        assert_eq!(
+            official_candidate("greeter", false).unwrap().as_str(),
+            "greeter"
+        );
+        assert!(
+            official_candidate("greeter", true).is_none(),
+            "an existing local match keeps today's folder resolution"
+        );
+        assert!(
+            official_candidate("2fast", false).is_none(),
+            "not a usable Package name, so not a candidate either way"
+        );
+        assert!(official_candidate("../greeter", false).is_none());
+        assert!(official_candidate("/abs/greeter", false).is_none());
+        assert!(official_candidate("~/greeter", false).is_none());
+    }
+
+    // ---- the shape contract ----
+
+    #[test]
+    fn a_client_only_package_is_valid_and_a_src_without_mod_rs_is_not() {
+        let tmp = TempDir::new().unwrap();
+
+        let client_only = tmp.path().join("ui");
+        std::fs::create_dir_all(client_only.join("client/addons/UI")).unwrap();
+        validate_shape(&client_only).unwrap();
+
+        let rust_only = tmp.path().join("logic");
+        std::fs::create_dir_all(rust_only.join("src")).unwrap();
+        std::fs::write(rust_only.join("src/mod.rs"), "").unwrap();
+        validate_shape(&rust_only).unwrap();
+
+        let headless = tmp.path().join("headless");
+        std::fs::create_dir_all(headless.join("src")).unwrap();
+        std::fs::write(headless.join("src/other.rs"), "").unwrap();
+        let error = validate_shape(&headless).unwrap_err();
+        assert!(error.to_string().contains("mod.rs"), "{error}");
+
+        let empty = tmp.path().join("empty");
+        std::fs::create_dir_all(&empty).unwrap();
+        let error = validate_shape(&empty).unwrap_err();
+        assert!(error.to_string().contains("not a Package"), "{error}");
+    }
+
+    #[test]
+    fn authored_or_generated_data_without_rust_is_a_package() {
+        let tmp = TempDir::new().unwrap();
+        for half in ["data", "scripts", "datascripts"] {
+            let package = tmp.path().join(half);
+            std::fs::create_dir_all(package.join(half)).unwrap();
+            validate_shape(&package).unwrap();
+        }
+    }
+
+    // ---- the install ----
+
+    #[test]
+    fn a_confirmed_install_copies_the_tree_stamps_it_and_stops_short_of_publishing() {
+        let tmp = TempDir::new().unwrap();
+        let project = checkout(&tmp);
+        let source = candidate(&tmp, "greeter");
+        let script_ids = b"{\"version\":1,\"package\":\"greeter\",\"ids\":{\"welcome\":100300}}\n";
+        std::fs::write(source.join("script-ids.json"), script_ids).unwrap();
+        let stack = FakeStack::new();
+
+        add(
+            &project,
+            &stack.runner(),
+            &Answer("yes"),
+            source.to_str().unwrap(),
+            false,
+        )
+        .unwrap();
+
+        let installed = project.packages_dir().join("greeter");
+        assert!(installed.join("src/mod.rs").is_file());
+        assert_eq!(
+            std::fs::read(installed.join("script-ids.json")).unwrap(),
+            script_ids
+        );
+        let recorded = ProvenanceStamp::read(&installed).expect("no provenance stamp");
+        assert_eq!(recorded.source_kind, stamp::SOURCE_LOCAL);
+        assert_eq!(recorded.source, source.to_string_lossy());
+        assert_eq!(
+            recorded.content_identity,
+            stamp::content_identity(&installed).unwrap(),
+            "the stamp must record the identity of what was actually copied"
+        );
+        // The remaining steps are PRINTED, never run: nothing here may touch the node.
+        for call in stack.rendered() {
+            assert!(!call.contains("spacetime publish"), "{call}");
+            assert!(!call.contains("--pack-client"), "{call}");
+        }
+    }
+
+    #[test]
+    fn a_mixed_family_package_delta_reaches_consent_after_the_trust_review() {
+        let tmp = TempDir::new().unwrap();
+        let project = checkout(&tmp);
+        let source = candidate(&tmp, "greeter");
+        let generated = source.join("data/.generated");
+        std::fs::create_dir_all(&generated).unwrap();
+        std::fs::write(
+            generated.join("catalogues.json"),
+            r#"{"version":1,"package":"greeter","source_hash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","claims":[{"table":"game_spell","key":{"spell_id":133},"operation":"update","fields":{"cooldown_ms":{"type":"u32","value":1500}}},{"table":"game_item_template","key":{"entry":25},"operation":"update","fields":{"name":{"type":"string","value":"Worn Shortsword"}}}]}"#,
+        )
+        .unwrap();
+        let prompt = RecordingAnswer {
+            asked: Cell::new(false),
+        };
+
+        let error = add(
+            &project,
+            &FakeStack::new().runner(),
+            &prompt,
+            source.to_str().unwrap(),
+            false,
+        )
+        .unwrap_err();
+
+        assert!(
+            prompt.asked.get(),
+            "the mixed Package Delta must reach consent: {error}"
+        );
+        assert!(!project.packages_dir().join("greeter").exists());
+    }
+
+    #[test]
+    fn a_prebuilt_multi_script_artifact_reaches_consent_without_script_sources() {
+        let tmp = TempDir::new().unwrap();
+        let project = checkout(&tmp);
+        let source = candidate(&tmp, "greeter");
+        let generated = source.join("data/.generated");
+        std::fs::create_dir_all(&generated).unwrap();
+        std::fs::write(
+            generated.join("runtime.json"),
+            r#"{"kind":"script","version":1,"package":"greeter","source_hash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","scripts":[{"script_id":100002,"name":"greeter.goodbye","event":"on_logout","priority":0,"enabled":true,"source":"return"},{"script_id":100001,"name":"greeter.greet","event":"on_login","priority":0,"enabled":true,"source":"return"}]}"#,
+        )
+        .unwrap();
+        let prompt = RecordingAnswer {
+            asked: Cell::new(false),
+        };
+
+        let error = add(
+            &project,
+            &FakeStack::new().runner(),
+            &prompt,
+            source.to_str().unwrap(),
+            false,
+        )
+        .unwrap_err();
+
+        assert!(
+            prompt.asked.get(),
+            "the prebuilt Script Artifact must reach consent: {error}"
+        );
+        assert!(!project.packages_dir().join("greeter").exists());
+    }
+
+    #[test]
+    fn the_copy_is_a_copy_never_a_link() {
+        // A linked Package would compile from a folder outside the checkout, so preflight, publish
+        // and client sync would each read whatever it said at the time.
+        let tmp = TempDir::new().unwrap();
+        let project = checkout(&tmp);
+        let source = candidate(&tmp, "greeter");
+        add(
+            &project,
+            &FakeStack::new().runner(),
+            &Answer("yes"),
+            source.to_str().unwrap(),
+            true,
+        )
+        .unwrap();
+
+        let installed = project.packages_dir().join("greeter");
+        assert!(!installed
+            .symlink_metadata()
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        std::fs::write(source.join("src/mod.rs"), "// changed at the source\n").unwrap();
+        assert!(
+            std::fs::read_to_string(installed.join("src/mod.rs"))
+                .unwrap()
+                .contains("game_hook"),
+            "editing the Package Source must not change the installed Package"
+        );
+    }
+
+    #[test]
+    fn an_answer_other_than_yes_copies_nothing() {
+        let tmp = TempDir::new().unwrap();
+        let project = checkout(&tmp);
+        let source = candidate(&tmp, "greeter");
+
+        let error = add(
+            &project,
+            &FakeStack::new().runner(),
+            &Answer("no"),
+            source.to_str().unwrap(),
+            false,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.exit_code(), crate::error::EXIT_USAGE);
+        assert!(!project.packages_dir().join("greeter").exists(), "{error}");
+    }
+
+    #[test]
+    fn an_invalid_name_or_shape_is_refused_before_anything_is_copied() {
+        let tmp = TempDir::new().unwrap();
+        let project = checkout(&tmp);
+
+        let bad_name = tmp.path().join("sources").join("2fast");
+        std::fs::create_dir_all(bad_name.join("src")).unwrap();
+        std::fs::write(bad_name.join("src/mod.rs"), "").unwrap();
+        let error = add(
+            &project,
+            &FakeStack::new().runner(),
+            &Answer("yes"),
+            bad_name.to_str().unwrap(),
+            true,
+        )
+        .unwrap_err();
+        assert_eq!(error.exit_code(), crate::error::EXIT_USAGE, "{error}");
+        assert!(
+            !project.packages_dir().exists(),
+            "nothing may be created: {error}"
+        );
+    }
+
+    #[test]
+    fn a_source_that_contains_the_checkout_is_refused_before_recursive_copying() {
+        let tmp = TempDir::new().unwrap();
+        let source = tmp.path().join("greeter");
+        std::fs::create_dir_all(source.join("src")).unwrap();
+        std::fs::write(source.join("src/mod.rs"), "pub fn greet() {}\n").unwrap();
+        let root = source.join("checkout");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("Cargo.toml"), "[workspace]\n").unwrap();
+        let project = ProjectLayout::from_root(&root).unwrap();
+
+        let error = add(
+            &project,
+            &FakeStack::new().runner(),
+            &Answer("yes"),
+            source.to_str().unwrap(),
+            true,
+        )
+        .unwrap_err();
+
+        assert!(
+            error.to_string().contains("destination is inside"),
+            "{error}"
+        );
+        assert!(!project.packages_dir().exists(), "{error}");
+    }
+
+    #[test]
+    fn a_name_either_inventory_already_holds_is_refused_before_the_copy() {
+        let tmp = TempDir::new().unwrap();
+        let project = checkout(&tmp);
+        let source = candidate(&tmp, "greeter");
+
+        // Enabled collision.
+        let enabled = project.packages_dir().join("greeter");
+        std::fs::create_dir_all(&enabled).unwrap();
+        std::fs::write(enabled.join("installed.txt"), "keep me\n").unwrap();
+        let error = add(
+            &project,
+            &FakeStack::new().runner(),
+            &Answer("yes"),
+            source.to_str().unwrap(),
+            true,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("enabled"), "{error}");
+        assert!(!error.to_string().contains("tracked by Git"), "{error}");
+        assert_eq!(
+            std::fs::read_to_string(enabled.join("installed.txt")).unwrap(),
+            "keep me\n"
+        );
+
+        // A disabled one would collide the moment it
+        // was re-enabled.
+        std::fs::remove_dir_all(&enabled).unwrap();
+        std::fs::create_dir_all(project.packages_disabled_dir().join("greeter")).unwrap();
+        let error = add(
+            &project,
+            &FakeStack::new().runner(),
+            &Answer("yes"),
+            source.to_str().unwrap(),
+            true,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("disabled"), "{error}");
+        assert!(!project.packages_dir().join("greeter").exists(), "{error}");
+    }
+
+    #[test]
+    fn a_name_that_folds_onto_an_installed_module_is_refused_too() {
+        // `my-package` and `my_package` both generate `pkg_my_package`; installing both would give
+        // the module two modules with one name.
+        let tmp = TempDir::new().unwrap();
+        let project = checkout(&tmp);
+        std::fs::create_dir_all(project.packages_dir().join("my-package")).unwrap();
+
+        let error =
+            check_collision(&project, &PackageName::parse("my_package").unwrap()).unwrap_err();
+
+        assert!(error.to_string().contains("pkg_my_package"), "{error}");
+    }
+
+    #[test]
+    fn an_install_over_a_git_tracked_destination_is_refused_before_anything_is_written() {
+        // `example` is core's tracked Reference Package; a same-named local folder must not
+        // silently overwrite it and dirty the checkout the way this bug did twice in production.
+        let tmp = TempDir::new().unwrap();
+        let project = checkout(&tmp);
+        let source = candidate(&tmp, "example");
+        let tracked = project.packages_dir().join("example");
+        std::fs::create_dir_all(&tracked).unwrap();
+        std::fs::write(tracked.join("README.md"), "tracked Reference Package\n").unwrap();
+        let stack = FakeStack::new().with_stdout("ls-files", "packages/example\n");
+
+        let error = add(
+            &project,
+            &stack.runner(),
+            &Answer("yes"),
+            source.to_str().unwrap(),
+            true,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.exit_code(), crate::error::EXIT_USAGE, "{error}");
+        assert!(
+            error.to_string().contains(&source.display().to_string()),
+            "{error}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains(&project.packages_dir().join("example").display().to_string()),
+            "{error}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(tracked.join("README.md")).unwrap(),
+            "tracked Reference Package\n"
+        );
+    }
+
+    #[test]
+    fn a_failed_preflight_publishes_nothing_and_says_how_to_undo_the_copy() {
+        let tmp = TempDir::new().unwrap();
+        let project = checkout(&tmp);
+        let source = candidate(&tmp, "greeter");
+        let stack = FakeStack::new().fail_on("cargo check", "the Package does not compile");
+
+        let error = add(
+            &project,
+            &stack.runner(),
+            &Answer("yes"),
+            source.to_str().unwrap(),
+            true,
+        )
+        .unwrap_err();
+
+        let installed = project.packages_dir().join("greeter");
+        assert!(error.to_string().contains("preflight failed"), "{error}");
+        // The exact undo, not "remove it manually" — the operator is holding a half-finished
+        // install and the path is the one thing they need.
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("rm -rf -- {}", shell_quote(&installed))),
+            "{error}"
+        );
+        assert!(
+            installed.is_dir(),
+            "the copy stays so it can be fixed in place"
+        );
+        for call in stack.rendered() {
+            assert!(!call.contains("spacetime publish"), "{call}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_inside_the_candidate_is_refused() {
+        let tmp = TempDir::new().unwrap();
+        let project = checkout(&tmp);
+        let source = candidate(&tmp, "greeter");
+        let outside = tmp.path().join("elsewhere.rs");
+        std::fs::write(&outside, "// not part of the reviewed folder\n").unwrap();
+        std::os::unix::fs::symlink(&outside, source.join("src/linked.rs")).unwrap();
+
+        let error = add(
+            &project,
+            &FakeStack::new().runner(),
+            &Answer("yes"),
+            source.to_str().unwrap(),
+            true,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("symlink"), "{error}");
+        assert!(
+            !project.packages_dir().join("greeter").exists(),
+            "a refused tree must leave no enabled partial Package: {error}"
+        );
+    }
+
+    #[test]
+    fn source_changes_after_the_review_are_not_installed() {
+        let tmp = TempDir::new().unwrap();
+        let project = checkout(&tmp);
+        let source = candidate(&tmp, "greeter");
+
+        let error = add(
+            &project,
+            &FakeStack::new().runner(),
+            &MutatingAnswer {
+                file: source.join("src/mod.rs"),
+            },
+            source.to_str().unwrap(),
+            false,
+        )
+        .unwrap_err();
+
+        assert!(
+            error.to_string().contains("changed after its trust review"),
+            "{error}"
+        );
+        assert!(!project.packages_dir().join("greeter").exists());
+        let staging = project.state_dir.join("package-installs");
+        assert!(
+            !staging.exists() || std::fs::read_dir(staging).unwrap().next().is_none(),
+            "the rejected staged copy must be cleaned"
+        );
+    }
+
+    #[test]
+    fn the_final_claim_never_replaces_even_an_empty_destination() {
+        let tmp = TempDir::new().unwrap();
+        let project = checkout(&tmp);
+        let name = PackageName::parse("greeter").unwrap();
+        let mut staged = StagedPackage::new(&project, &name).unwrap();
+        std::fs::write(staged.path().join("payload.txt"), "staged").unwrap();
+        let destination = project.packages_dir().join(name.as_str());
+        std::fs::create_dir_all(&destination).unwrap();
+
+        let error = staged.install(&destination).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("Nothing was merged or overwritten"));
+        assert!(std::fs::read_dir(&destination).unwrap().next().is_none());
+    }
+
+    #[test]
+    fn folded_package_names_share_one_interprocess_claim() {
+        let tmp = TempDir::new().unwrap();
+        let project = checkout(&tmp);
+        let hyphen = PackageName::parse("foo-bar").unwrap();
+        let underscore = PackageName::parse("foo_bar").unwrap();
+
+        let first = PackageClaim::acquire(&project, &hyphen).unwrap();
+        let error = PackageClaim::acquire(&project, &underscore).unwrap_err();
+
+        assert!(error.to_string().contains("pkg_foo_bar"), "{error}");
+        drop(first);
+        PackageClaim::acquire(&project, &underscore).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn linked_inventory_entries_are_reported_without_following_them() {
+        let tmp = TempDir::new().unwrap();
+        let project = checkout(&tmp);
+        std::fs::create_dir_all(project.packages_dir()).unwrap();
+        std::os::unix::fs::symlink("/", project.packages_dir().join("outside")).unwrap();
+
+        let error = inventory(&project).unwrap_err();
+
+        assert!(error.to_string().contains("linked Package"), "{error}");
+    }
+
+    // ---- `packages new` ----
+
+    const COLLECTION_REVISION: &str = "1234567890abcdef1234567890abcdef12345678";
+
+    fn reference_collection(tmp: &TempDir, rung: &str, files: &[(&str, &[u8])]) -> FakeStack {
+        let collection = tmp.path().join("collection");
+        for (name, bytes) in files {
+            let path = collection.join(rung).join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, bytes).unwrap();
+        }
+        FakeStack::new()
+            .with_git_clone(&collection)
+            .with_stdout("rev-parse HEAD", &format!("{COLLECTION_REVISION}\n"))
+    }
+
+    #[test]
+    fn a_script_scaffold_renames_source_and_records_its_rung_and_revision() {
+        let tmp = TempDir::new().unwrap();
+        let project = checkout(&tmp);
+        let stack = reference_collection(&tmp, DEFAULT_REFERENCE, &[
+            ("scripts/welcome.ts", b"function welcome(event: PlayerLoginEvent): void { send_chat(event.player, \"example-script\"); }\nevents.player.onLogin(welcome);\n"),
+            ("script-ids.json", b"{\"version\":1,\"package\":\"example-script\",\"ids\":{\"welcome\":100300}}\n"),
+            ("data/.generated/example-script.script.json", b"old generated artifact"),
+            ("data/.generated/script.identity", b"old identity"),
+        ]);
+        new(&project, &stack.runner(), "my-greeter", DEFAULT_REFERENCE).unwrap();
+        let scaffolded = project.packages_dir().join("my-greeter");
+        let source = std::fs::read_to_string(scaffolded.join("scripts/welcome.ts")).unwrap();
+        assert!(source.contains("my-greeter"), "{source}");
+        assert!(!source.contains("example-script"), "{source}");
+        assert!(!scaffolded.join("src").exists());
+        assert!(!scaffolded.join("data/.generated").exists());
+        assert!(!scaffolded.join("script-ids.json").exists());
+        let readme = std::fs::read_to_string(scaffolded.join("README.md")).unwrap();
+        assert!(readme.contains("packages apply"));
+        assert!(readme.contains(&format!("/tree/{COLLECTION_REVISION}/example-script")));
+        assert!(!readme.contains("packages add"));
+
+        let recorded = ProvenanceStamp::read(&scaffolded).unwrap();
+        assert_eq!(recorded.source_kind, stamp::SOURCE_SCAFFOLD);
+        assert_eq!(recorded.source, "example-script");
+        assert_eq!(recorded.revision, COLLECTION_REVISION);
+        assert_eq!(
+            recorded.content_identity,
+            stamp::content_identity(&scaffolded).unwrap()
+        );
+        assert!(stack
+            .rendered()
+            .iter()
+            .any(|call| call.contains("refs/tags/api-v1")));
+        for call in stack.rendered() {
+            assert!(!call.contains("spacetime publish"), "{call}");
+            assert!(!call.contains("--pack-client"), "{call}");
+        }
+    }
+
+    #[test]
+    fn a_rust_scaffold_keeps_the_package_name_distinct_from_its_rust_identifier() {
+        let tmp = TempDir::new().unwrap();
+        let project = checkout(&tmp);
+        let stack = reference_collection(
+            &tmp,
+            "example-all",
+            &[
+                (
+                    "src/mod.rs",
+                    b"const PACKAGE: &str = \"example-all\";\nfn example_all_on_login() {}\n",
+                ),
+                (
+                    "scripts/welcome.lua",
+                    b"-- @event example-all.welcome\n-- @id 100302\nreturn 1\n",
+                ),
+            ],
+        );
+        new(&project, &stack.runner(), "my-greeter", "example-all").unwrap();
+        let folder = project.packages_dir().join("my-greeter");
+        let source = std::fs::read_to_string(folder.join("src/mod.rs")).unwrap();
+        assert!(source.contains("\"my-greeter\""), "{source}");
+        assert!(source.contains("fn my_greeter_on_login"), "{source}");
+        assert!(std::fs::read_to_string(folder.join("scripts/welcome.lua"))
+            .unwrap()
+            .contains("@event my-greeter.welcome"));
+    }
+
+    #[test]
+    fn a_client_scaffold_renames_addon_paths_and_preserves_binary_assets() {
+        let tmp = TempDir::new().unwrap();
+        let project = checkout(&tmp);
+        let stack = reference_collection(
+            &tmp,
+            "example-client",
+            &[
+                (
+                    "client/addons/example-client/example-client.toc",
+                    b"example-client.lua\n",
+                ),
+                (
+                    "client/addons/example-client/example-client.lua",
+                    b"print(\"example-client\")\n",
+                ),
+                ("client/art/image.blp", &[0xff, 0xfe, 1]),
+            ],
+        );
+        new(&project, &stack.runner(), "my-greeter", "example-client").unwrap();
+        let client = project.packages_dir().join("my-greeter/client");
+        assert_eq!(
+            std::fs::read_to_string(client.join("addons/my-greeter/my-greeter.toc")).unwrap(),
+            "my-greeter.lua\n"
+        );
+        assert!(client.join("addons/my-greeter/my-greeter.lua").is_file());
+        assert_eq!(
+            std::fs::read(client.join("art/image.blp")).unwrap(),
+            &[0xff, 0xfe, 1]
+        );
+    }
+
+    #[test]
+    fn a_scaffold_collision_or_invalid_name_or_rung_never_fetches() {
+        let tmp = TempDir::new().unwrap();
+        let project = checkout(&tmp);
+        std::fs::create_dir_all(project.packages_dir().join("greeter")).unwrap();
+        for (name, rung) in [
+            ("greeter", DEFAULT_REFERENCE),
+            ("2fast", DEFAULT_REFERENCE),
+            ("fresh", "dungeons"),
+        ] {
+            let stack = FakeStack::new();
+            let error = new(&project, &stack.runner(), name, rung).unwrap_err();
+            assert_eq!(error.exit_code(), crate::error::EXIT_USAGE, "{error}");
+            assert!(stack.calls().is_empty());
+        }
+    }
+
+    #[test]
+    fn scaffold_names_must_fit_the_artifacts_the_rung_will_build() {
+        for name in ["Greeter".to_string(), "a".repeat(57)] {
+            let tmp = TempDir::new().unwrap();
+            let project = checkout(&tmp);
+            let stack = reference_collection(
+                &tmp,
+                DEFAULT_REFERENCE,
+                &[("scripts/welcome.ts", b"function script() {}")],
+            );
+            let error = new(&project, &stack.runner(), &name, DEFAULT_REFERENCE).unwrap_err();
+            assert_eq!(error.exit_code(), crate::error::EXIT_USAGE, "{error}");
+            assert!(!project.packages_dir().join(&name).exists());
+            assert!(!stack
+                .rendered()
+                .iter()
+                .any(|call| call.contains("cargo check")));
+        }
+        let tmp = TempDir::new().unwrap();
+        let project = checkout(&tmp);
+        let stack = reference_collection(
+            &tmp,
+            DEFAULT_REFERENCE,
+            &[("scripts/welcome.ts", b"function script() {}")],
+        );
+        new(
+            &project,
+            &stack.runner(),
+            &"a".repeat(56),
+            DEFAULT_REFERENCE,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn a_missing_collection_rung_leaves_no_scaffold() {
+        let tmp = TempDir::new().unwrap();
+        let project = checkout(&tmp);
+        let stack = reference_collection(&tmp, "example-rust", &[("src/mod.rs", b"")]);
+        let error = new(&project, &stack.runner(), "greeter", DEFAULT_REFERENCE).unwrap_err();
+        assert!(error.to_string().contains("example-script"), "{error}");
+        assert!(!project.packages_dir().join("greeter").exists());
+    }
+
+    #[test]
+    fn a_failed_preflight_keeps_the_scaffold_and_explains_how_to_remove_it() {
+        let tmp = TempDir::new().unwrap();
+        let project = checkout(&tmp);
+        let stack = reference_collection(
+            &tmp,
+            "example-rust",
+            &[("src/mod.rs", b"fn example_rust() {}")],
+        )
+        .fail_on("cargo check", "the scaffold does not compile");
+        let error = new(&project, &stack.runner(), "greeter", "example-rust").unwrap_err();
+        let scaffolded = project.packages_dir().join("greeter");
+        assert!(error.to_string().contains("preflight failed"), "{error}");
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("rm -rf -- {}", shell_quote(&scaffolded))),
+            "{error}"
+        );
+        assert!(scaffolded.is_dir());
+    }
+
+    // ---- `packages list` ----
+
+    #[test]
+    fn list_reports_both_inventories_and_the_drift_of_each() {
+        let tmp = TempDir::new().unwrap();
+        let project = checkout(&tmp);
+        let source = candidate(&tmp, "greeter");
+        add(
+            &project,
+            &FakeStack::new().runner(),
+            &Answer("yes"),
+            source.to_str().unwrap(),
+            true,
+        )
+        .unwrap();
+        let installed = project.packages_dir().join("greeter");
+
+        let installed_packages = inventory(&project).unwrap();
+        assert_eq!(installed_packages.len(), 1);
+        assert_eq!(installed_packages[0].state, PackageState::Enabled);
+        let recorded = installed_packages[0].stamp.clone().unwrap();
+        assert_eq!(
+            drift(&recorded, &stamp::content_identity(&installed).unwrap()),
+            "clean"
+        );
+
+        // Edit the installed copy: the recorded identity no longer describes what is on disk.
+        std::fs::write(installed.join("src/mod.rs"), "// edited in place\n").unwrap();
+        assert!(
+            drift(&recorded, &stamp::content_identity(&installed).unwrap()).contains("DRIFTED")
+        );
+        let current = stamp::content_identity(&installed).unwrap();
+        let report = identity_report(&recorded, &current);
+        assert!(report.contains(&recorded.content_identity), "{report}");
+        assert!(report.contains(&current), "{report}");
+        assert!(report.contains("DRIFTED"), "{report}");
+
+        // A disabled Package is in the inventory too, and `list` renders both.
+        std::fs::create_dir_all(project.packages_disabled_dir().join("retired/src")).unwrap();
+        let installed_packages = inventory(&project).unwrap();
+        assert_eq!(installed_packages.len(), 2);
+        assert_eq!(installed_packages[1].state, PackageState::Disabled);
+        list(&project).unwrap();
+    }
+
+    #[test]
+    fn a_package_with_no_stamp_is_described_rather_than_crashing_the_listing() {
+        // The pre-existing case: a folder somebody dropped into packages/ by hand, or one that
+        // predates `packages add`.
+        let tmp = TempDir::new().unwrap();
+        let project = checkout(&tmp);
+        std::fs::create_dir_all(project.packages_dir().join("handmade/src")).unwrap();
+        std::fs::write(
+            project.packages_dir().join("handmade/src/mod.rs"),
+            "pub fn helper() {}\n",
+        )
+        .unwrap();
+
+        let installed_packages = inventory(&project).unwrap();
+
+        assert_eq!(installed_packages.len(), 1);
+        assert!(installed_packages[0].stamp.is_none());
+        list(&project).unwrap();
+    }
+
+    #[test]
+    fn an_empty_checkout_lists_nothing_and_says_how_to_install() {
+        let tmp = TempDir::new().unwrap();
+        let project = checkout(&tmp);
+        assert!(inventory(&project).unwrap().is_empty());
+        list(&project).unwrap();
+    }
+
+    #[test]
+    fn recovery_paths_are_shell_quoted_as_one_literal_argument() {
+        let path = Path::new("/tmp/a package/'quoted';$(do-not-run)");
+        assert_eq!(
+            shell_quote(path),
+            "'/tmp/a package/'\"'\"'quoted'\"'\"';$(do-not-run)'"
+        );
+    }
+}
