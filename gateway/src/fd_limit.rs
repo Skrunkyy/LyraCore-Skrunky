@@ -1,7 +1,12 @@
+#[cfg(unix)]
 use std::io;
 
 /// What [`plan_raise`] decided to do about the limits it read. Split out from the syscalls so the
 /// decision — including the "don't bother" and "never lower" cases — is a pure function with tests.
+///
+/// Unix-only, like the rest of the rlimit planning: non-Unix targets have no `RLIMIT_NOFILE` to
+/// plan about (see [`raise_nofile_soft_to_hard`]'s Windows no-op).
+#[cfg(unix)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RaisePlan {
     /// Soft is already at (or, pathologically, above) hard. Nothing to raise, no syscall to make.
@@ -17,6 +22,7 @@ pub enum RaisePlan {
 /// launched with `--ulimit nofile=65536:65536` must come out of here untouched rather than
 /// "normalised". A soft limit somehow *above* hard (which the kernel does not produce, but which we
 /// should not react to by shrinking it) takes the same branch.
+#[cfg(unix)]
 pub fn plan_raise(soft: u64, hard: u64) -> RaisePlan {
     if soft >= hard {
         RaisePlan::AlreadyAtHard { limit: soft }
@@ -31,6 +37,7 @@ pub fn plan_raise(soft: u64, hard: u64) -> RaisePlan {
 /// Render a limit for a log line, spelling `RLIM_INFINITY` as `unlimited` rather than as
 /// `18446744073709551615` — an operator reading the startup banner should not have to recognise
 /// `u64::MAX` on sight.
+#[cfg(unix)]
 pub fn describe_limit(v: u64) -> String {
     if v == unlimited() {
         "unlimited".to_string()
@@ -42,9 +49,10 @@ pub fn describe_limit(v: u64) -> String {
 /// `RLIM_INFINITY` as a `u64`.
 ///
 /// This module speaks `u64` throughout and relies on `libc::rlim_t` **being** `u64` — true on Linux
-/// and macOS, the two platforms this workspace builds on. No `as` cast anywhere here, deliberately:
-/// a platform with a narrower `rlim_t` should fail to compile loudly rather than have a cast
-/// quietly truncate a limit. The `const` below is that check, evaluated at compile time.
+/// and macOS, the two Unix platforms this workspace builds on. No `as` cast anywhere here,
+/// deliberately: a platform with a narrower `rlim_t` should fail to compile loudly rather than have
+/// a cast quietly truncate a limit. The `const` below is that check, evaluated at compile time.
+#[cfg(unix)]
 const fn unlimited() -> u64 {
     libc::RLIM_INFINITY
 }
@@ -54,6 +62,7 @@ const fn unlimited() -> u64 {
 ///
 /// Returns the soft limit in force when this returns, purely so tests and callers can assert on it;
 /// the log line is the real product.
+#[cfg(unix)]
 pub fn raise_nofile_soft_to_hard() -> Option<u64> {
     let (soft, hard) = match read_nofile() {
         Ok(pair) => pair,
@@ -100,6 +109,20 @@ pub fn raise_nofile_soft_to_hard() -> Option<u64> {
     }
 }
 
+/// Windows (and any other non-Unix target) has no `RLIMIT_NOFILE`: socket handles are bounded by
+/// available kernel memory, not by a small per-process descriptor table, so there is no limit to
+/// raise. This is a deliberate no-op that logs, so `main`'s startup order is identical on every
+/// platform and an operator reading the banner sees why nothing happened.
+#[cfg(not(unix))]
+pub fn raise_nofile_soft_to_hard() -> Option<u64> {
+    log::info!(
+        "fd limit: this platform has no RLIMIT_NOFILE — nothing to raise (socket handles are not \
+         bounded by a per-process descriptor table)"
+    );
+    None
+}
+
+#[cfg(unix)]
 fn read_nofile() -> io::Result<(u64, u64)> {
     let mut lim = libc::rlimit {
         rlim_cur: 0,
@@ -114,6 +137,7 @@ fn read_nofile() -> io::Result<(u64, u64)> {
     Ok((lim.rlim_cur, lim.rlim_max))
 }
 
+#[cfg(unix)]
 fn set_nofile_soft(soft: u64, hard: u64) -> io::Result<()> {
     let lim = libc::rlimit {
         rlim_cur: soft,
@@ -128,7 +152,7 @@ fn set_nofile_soft(soft: u64, hard: u64) -> io::Result<()> {
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 

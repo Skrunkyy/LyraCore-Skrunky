@@ -56,6 +56,10 @@ pub enum AcceptOutcome {
 /// The errnos that mean the *listening socket* is broken rather than one connection.
 ///
 /// `docs/accept-policy.md` explains the allowlist and the transient resource errors.
+///
+/// These are Unix errno values. On Windows `raw_os_error()` carries a WSA code instead, so this
+/// allowlist matches nothing there and every accept error retries — the backoff below bounds the
+/// cost of that, and a truly dead listener is a startup failure the bind already reports.
 const FATAL_ACCEPT_ERRNOS: &[i32] = &[libc::EBADF, libc::ENOTSOCK, libc::EINVAL, libc::EFAULT];
 
 /// Decide whether an accept-path error ends the listener task or one connection.
@@ -135,6 +139,11 @@ mod tests {
     }
 
     /// Resource exhaustion and interrupted connections leave the listener available.
+    ///
+    /// Unix-only: these are the Linux/`accept(2)` errno values the policy was shaped against. On
+    /// Windows `raw_os_error()` carries a WSA code instead, so the same test would be pinning the
+    /// wrong numbers — see the note on [`classify_accept_error`].
+    #[cfg(unix)]
     #[test]
     fn the_errnos_that_killed_the_realm_are_transient() {
         for (errno, name) in [
@@ -159,6 +168,7 @@ mod tests {
     /// The Linux "already-pending network error" family, which `accept(2)` says to retry like
     /// `EAGAIN`. `EOPNOTSUPP` is in here on purpose — see the module docs for why its other,
     /// permanent meaning cannot apply to a `TcpListener::bind`.
+    #[cfg(unix)]
     #[test]
     fn pending_network_errors_and_per_connection_verdicts_are_transient() {
         for errno in [
